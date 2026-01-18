@@ -129,4 +129,6 @@ sudo ./hyperion_ctrl
 
 This project is dual-licensed under the **GPLv2** (Kernel components) and **MIT** (User space components) to ensure compatibility with Linux kernel helper access and distribution norms.
 
+---
+
 **Author:** Nevin | **Lab:** Systems Security Research
