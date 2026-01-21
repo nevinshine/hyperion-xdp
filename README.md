@@ -1,6 +1,6 @@
 # Project Hyperion: Datapath Security Research
 
-![Status](https://img.shields.io/badge/Status-M1_Ingress_Filter-yellow?style=flat-square)
+![Status](https://img.shields.io/badge/Status-M2_Stateful_Firewall-green?style=flat-square)
 ![Layer](https://img.shields.io/badge/Layer-Kernel_Datapath_(XDP)-blue?style=flat-square)
 ![Role](https://img.shields.io/badge/Role-Network_Satellite-blueviolet?style=flat-square)
 ![License](https://img.shields.io/badge/License-GPLv2_%2F_MIT-lightgrey?style=flat-square)
@@ -17,7 +17,7 @@
 Modern endpoint security focuses heavily on process-level control (syscalls). However, by the time a packet reaches a process, the kernel has already consumed significant resources parsing headers and managing buffers.
 
 **The Research Question**
-> *Can security policy be enforced at wire speed, retaining temporal context, before the Operating System commits resources?*
+> *Can security policy be enforced at wire speed, retaining temporal context (state), before the Operating System commits resources?*
 
 ### The "Two Towers" Architecture
 
@@ -42,22 +42,22 @@ graph TD
     A[Network Interface NIC] -->|XDP Hook| B{Hyperion Enforcer}
     B -- XDP_DROP --> C[Discard Zero Copy]
     B -- XDP_PASS --> D[Linux Kernel Stack]
-    B -- Telemetry --> E[(eBPF Maps)]
-    E <--> F[User Space Controller]
-    F -->|Policy Updates| E
+    B -- State Update --> E[(eBPF LRU Map)]
+    E -->|Rate Limit Logic| B
 
 ```
 
 ### 1. Kernel Enforcer (`src/kern/`)
 
 * **Technology:** Restricted C (eBPF).
-* **Role:** Parses Ethernet/IP/TCP headers and applies verdicts.
+* **Role:** Parses Ethernet/IP headers and applies stateful verdicts.
+* **M2 Capability:** Uses `BPF_MAP_TYPE_LRU_HASH` to track IP flow volume in kernel memory.
 * **Performance:** Operates in the driver's native execution path.
 
 ### 2. User Space Controller (`src/user/`)
 
-* **Technology:** Go (using `cilium/ebpf` or `libbpf`).
-* **Role:** Loads BPF programs, manages Map lifecycles (Hash/LRU), and exports telemetry to the Sentinel Runtime.
+* **Technology:** Go / Standard Linux Tools (`iproute2`).
+* **Role:** Manages the lifecycle of the XDP program and inspects map data.
 
 ---
 
@@ -70,33 +70,25 @@ We define success through distinct capability milestones.
 * **Goal:** Establish eBPF toolchain and verification pipeline.
 * **Deliverable:** `XDP_PASS` skeleton compiling with Clang/LLVM.
 
-### [Phase M1] Stateless Filtering (Current Status)
+### [Phase M1] Stateless Filtering (Complete)
 
 * **Goal:** Implement high-performance dropping based on L3/L4 headers.
-* **Research Validation:** Benchmarking CPU load of `XDP_DROP` vs `iptables` under flood conditions. Verified via Kernel Trace Logs (`bpf_trace_printk`).
+* **Research Validation:** Validated `XDP_DROP` against hardcoded IP targets.
 
-### [Phase M2] Temporal State
+### [Phase M2] Stateful Tracking (Current Status)
 
 * **Goal:** Implement stateful logic in BPF Maps.
-* **Logic:** Track packet arrival timestamps to detect periodic C2 beacons.
+* **Validation:** Implemented **Rate Limiting** via `BPF_MAP_TYPE_LRU_HASH`.
+* **Outcome:** System successfully detects and drops volumetric floods (ICMP) by tracking packet counts per Source IP in kernel memory.
 
-```c
-// Concept Logic
-u64 delta = now - last_seen_time;
-if (abs(delta - BEACON_INTERVAL) < EPSILON) {
-    return XDP_DROP;
-}
-
-```
-
-### [Phase M3] Sentinel Integration
+### [Phase M3] Sentinel Integration (Next)
 
 * **Goal:** Correlate network signals with process intent.
-* **Scenario:** Hyperion flags a C2 beacon; Sentinel maps it to a PID and halts execution (via existing syscall lineage tracking).
+* **Scenario:** Hyperion flags a C2 beacon; Sentinel maps it to a PID and halts execution.
 
-### [Phase M4] Policy Learning (Auto-Profiling)
+### [Phase M4] Policy Learning
 
-* **Goal:** Generate "Least Privilege" network profiles by observing safe traffic patterns, solving the manual policy authorship problem.
+* **Goal:** Generate "Least Privilege" network profiles by observing safe traffic patterns.
 
 ---
 
@@ -104,22 +96,26 @@ if (abs(delta - BEACON_INTERVAL) < EPSILON) {
 
 ### Prerequisites
 
-* Linux Kernel 5.4+ (5.10+ recommended for CO-RE)
+* Linux Kernel 5.4+ (5.10+ recommended)
 * `clang`, `llvm`, `libbpf-dev`
-* `golang` (1.23+)
+* `make`
 
-### Quick Start (M1)
+### Quick Start (M2)
+
+Hyperion M2 uses a standardized Makefile workflow.
 
 ```bash
-# 1. Generate Go Bindings & Compile C
-cd src/user
-go generate
+# 1. Compile the Kernel Program
+make
+# Output: bin/hyperion_core.o
 
-# 2. Build the Controller
-go build -o hyperion_ctrl
+# 2. Attach to Loopback (Load)
+make load
+# Result: XDP program attached to 'lo'
 
-# 3. Run (Requires Root for Network Hook)
-sudo ./hyperion_ctrl
+# 3. Verify Defense (View Logs)
+make logs
+# Output: "Hyperion M2: DROP -> Flood from IP..."
 
 ```
 
