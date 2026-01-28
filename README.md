@@ -1,7 +1,3 @@
-Here is the professional, emoji-free **README.md** for Hyperion. It reflects the current stable architecture (vM4.6), includes the requested GIF asset path, and documents the complete version history as requested.
-
----
-
 # Project Hyperion: Datapath Security Research
 
 **Hyperion** is a high-performance network security engine designed to enforce content-aware policy at the NIC driver level. Unlike traditional firewalls that operate at the socket layer (Netfilter), Hyperion uses **eBPF (Extended Berkeley Packet Filter)** and **XDP (Express Data Path)** to reject malicious payloads before the Linux Kernel allocates memory.
