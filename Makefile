@@ -1,41 +1,25 @@
-# Hyperion Build System (M2)
+CLANG ?= clang
+GO ?= go
+BIN_DIR := bin
+BIN_NAME := hyperion_ctrl
 
-# Compiler & Flags
-CLANG = clang
-CFLAGS = -O2 -g -Wall -target bpf -c
+export BPF_CLANG := $(CLANG)
+export BPF_CFLAGS := -O2 -g -Wall -Werror
 
-# Directories
-SRC_DIR = src/kern
-BIN_DIR = bin
+.PHONY: all clean build run
 
-# --- FIXED: Matches your actual file name ---
-TARGET = $(BIN_DIR)/hyperion_core.o
-SOURCE = $(SRC_DIR)/hyperion_core.c
-# --------------------------------------------
+all: build
 
-# Build Rules
-all: $(TARGET)
-
-$(TARGET): $(SOURCE)
-	@echo "  [BPF] Compiling Hyperion M2 (Stateful)..."
+build:
 	@mkdir -p $(BIN_DIR)
-	$(CLANG) $(CFLAGS) -o $@ $<
-	@echo "  [OK] Build Complete: $@"
+	@echo "  [BPF] Generating Artifacts..."
+	cd src/user && $(GO) generate
+	@echo "  [GO] Compiling Controller..."
+	$(GO) build -o $(BIN_DIR)/$(BIN_NAME) ./src/user
 
 clean:
 	rm -rf $(BIN_DIR)
+	rm -f src/user/bpf_*.go src/user/bpf_*.o src/user/xdp_bpf.go src/user/xdp_bpf.o
 
-# Utility: Load the XDP program
-load: $(TARGET)
-	@echo "  [NET] Attaching to Loopback (lo)..."
-	sudo ip link set dev lo xdp obj $(TARGET) sec xdp verbose
-
-# Utility: Unload the XDP program
-unload:
-	@echo "  [NET] Detaching from Loopback..."
-	sudo ip link set dev lo xdp off
-
-# Utility: View the Kernel Trace Pipe
-logs:
-	@echo "  [LOG] Reading /sys/kernel/debug/tracing/trace_pipe..."
-	sudo cat /sys/kernel/debug/tracing/trace_pipe
+run: build
+	sudo ./$(BIN_DIR)/$(BIN_NAME) -iface lo

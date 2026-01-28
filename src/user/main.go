@@ -1,50 +1,88 @@
+/* HYPERION CONTROLLER M4.6 (Visual Upgrade) */
 package main
 
 import (
+	"bufio"
+	"bytes"
+	"encoding/binary"
+	"flag"
+	"fmt"
 	"log"
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
+	"time"
 
+	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
+	"github.com/cilium/ebpf/ringbuf"
 	"github.com/cilium/ebpf/rlimit"
 )
 
-// ANSI Color Codes
+// --- COLORS & VISUALS ---
 const (
 	ColorReset  = "\033[0m"
-	ColorGreen  = "\033[32m"
 	ColorRed    = "\033[31m"
-	ColorCyan   = "\033[36m"
+	ColorGreen  = "\033[32m"
 	ColorYellow = "\033[33m"
+	ColorBlue   = "\033[34m"
+	ColorPurple = "\033[35m"
+	ColorCyan   = "\033[36m"
+	ColorWhite  = "\033[37m"
 )
 
-// $BPF_CLANG_CFLAGS is automatically set by the Makefile
+const (
+	ConfigFile = "signatures.txt"
+	MaxRules   = 5
+)
+
+// Must match Kernel Struct
+type Policy struct {
+	Signature [8]byte
+	SigLen    uint32
+	Active    uint32
+}
+
+type AlertEvent struct {
+	SrcIP   uint32
+	DstIP   uint32
+	Snippet [8]byte
+	RuleID  uint32
+}
+
+var loadedSigs []string
+
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc $BPF_CLANG -cflags $BPF_CFLAGS bpf ../kern/hyperion_core.c -- -I../common
 
 func main() {
-	// Custom logger without timestamp for cleaner CLI look
-	log.SetFlags(0)
+	ifaceName := flag.String("iface", "lo", "Interface")
+	flag.Parse()
 
-	if len(os.Args) < 2 {
-		log.Fatalf("%s[!] Usage: %s -iface <interface>%s", ColorRed, os.Args[0], ColorReset)
-	}
-	ifaceName := os.Args[2]
+	// Print the Logo first!
+	printBanner()
 
+	// 1. Init
 	if err := rlimit.RemoveMemlock(); err != nil {
 		log.Fatal(err)
 	}
 
 	objs := bpfObjects{}
 	if err := loadBpfObjects(&objs, nil); err != nil {
-		log.Fatalf("%s[!] Loading objects failed: %v%s", ColorRed, err, ColorReset)
+		log.Fatalf("%s[!] Load BPF failed: %v%s", ColorRed, err, ColorReset)
 	}
 	defer objs.Close()
 
-	iface, err := net.InterfaceByName(ifaceName)
+	// 2. Load Config
+	if err := reloadSignatures(objs.PolicyMap); err != nil {
+		log.Printf("%s[!] Initial load warning: %v%s", ColorYellow, err, ColorReset)
+	}
+
+	// 3. Attach XDP
+	iface, err := net.InterfaceByName(*ifaceName)
 	if err != nil {
-		log.Fatalf("%s[!] Interface lookup failed: %s%s", ColorRed, err, ColorReset)
+		log.Fatalf("%s[!] Interface %s not found%s", ColorRed, *ifaceName, ColorReset)
 	}
 
 	l, err := link.AttachXDP(link.XDPOptions{
@@ -52,20 +90,130 @@ func main() {
 		Interface: iface.Index,
 	})
 	if err != nil {
-		log.Fatalf("%s[!] XDP Attach failed: %s%s", ColorRed, err, ColorReset)
+		log.Fatalf("%s[!] XDP Attach failed: %v%s", ColorRed, err, ColorReset)
 	}
 	defer l.Close()
 
-	// --- STATUS OUTPUT ---
-	log.Printf("%s[+] Hyperion M3.0 (DPI) Attached%s -> %s%s%s", ColorGreen, ColorReset, ColorCyan, ifaceName, ColorReset)
-	log.Printf("%s[+] Active Defense Engine:%s %sSIGNATURE_SCAN (TCP)%s", ColorGreen, ColorReset, ColorYellow, ColorReset)
-	log.Printf("%s[>] Target Signature:%s 'hack' (Hex: 0x68 0x61 0x63 0x6b)", ColorCyan, ColorReset)
-	log.Printf("%s[!] Verdict:%s DROP IMMEDIATE", ColorRed, ColorReset)
-	log.Printf("\nPress Ctrl+C to detach...")
+	// 4. Telemetry Loop
+	rd, err := ringbuf.NewReader(objs.AlertRingbuf)
+	if err != nil {
+		log.Fatalf("%s[!] Ringbuf failed: %v%s", ColorRed, err, ColorReset)
+	}
+	defer rd.Close()
 
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-	<-stop
+	fmt.Printf("%s[+] Hyperion Active on %s%s\n", ColorGreen, *ifaceName, ColorReset)
+	fmt.Printf("%s[i] PID: %d (Run 'kill -HUP %d' to reload)%s\n", ColorCyan, os.Getpid(), os.Getpid(), ColorReset)
+	fmt.Println(strings.Repeat("-", 60))
+	fmt.Printf("%sWaiting for threats...%s\n", ColorWhite, ColorReset)
 
-	log.Printf("\n%s[-] Detaching Hyperion...%s", ColorRed, ColorReset)
+	go func() {
+		for {
+			record, err := rd.Read()
+			if err != nil {
+				if err == ringbuf.ErrClosed {
+					return
+				}
+				continue
+			}
+
+			var event AlertEvent
+			binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &event)
+
+			name := "UNKNOWN"
+			if int(event.RuleID) < len(loadedSigs) {
+				name = loadedSigs[event.RuleID]
+			}
+
+			// ALERT LOG STYLE
+			fmt.Printf("%s[%s] ALERT: Blocked '%s' from %s%s\n",
+				ColorRed,
+				time.Now().Format("15:04:05"),
+				name,
+				int2ip(event.SrcIP),
+				ColorReset)
+		}
+	}()
+
+	// 5. Signal Handling
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+
+	for {
+		sig := <-sigChan
+		switch sig {
+		case syscall.SIGHUP:
+			fmt.Printf("\n%s[!] Reloading signatures...%s\n", ColorYellow, ColorReset)
+			if err := reloadSignatures(objs.PolicyMap); err != nil {
+				fmt.Printf("%s[-] Reload Error: %v%s\n", ColorRed, err, ColorReset)
+			} else {
+				fmt.Printf("%s[+] Reload Complete.%s\n", ColorGreen, ColorReset)
+			}
+		case syscall.SIGINT, syscall.SIGTERM:
+			fmt.Printf("\n%s[-] Shutting down Hyperion.%s\n", ColorRed, ColorReset)
+			return
+		}
+	}
+}
+
+func reloadSignatures(m *ebpf.Map) error {
+	f, err := os.Open(ConfigFile)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	var newSigs []string
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line != "" && !strings.HasPrefix(line, "#") {
+			newSigs = append(newSigs, line)
+		}
+	}
+
+	if len(newSigs) > MaxRules {
+		return fmt.Errorf("Too many rules (Max %d)", MaxRules)
+	}
+
+	for i := 0; i < MaxRules; i++ {
+		var pol Policy
+		if i < len(newSigs) {
+			s := newSigs[i]
+			if len(s) > 8 {
+				s = s[:8]
+			}
+			copy(pol.Signature[:], []byte(s))
+			pol.SigLen = uint32(len(s))
+			pol.Active = 1
+			fmt.Printf("    %s-> Loaded Rule %d: %s%s\n", ColorBlue, i, s, ColorReset)
+		} else {
+			pol.Active = 0
+		}
+		if err := m.Put(uint32(i), pol); err != nil {
+			return err
+		}
+	}
+	loadedSigs = newSigs
+	return nil
+}
+
+func int2ip(nn uint32) net.IP {
+	ip := make(net.IP, 4)
+	binary.LittleEndian.PutUint32(ip, nn)
+	return ip
+}
+
+func printBanner() {
+	banner := `
+%s    __  __                      _
+   / / / /_  ______  ___  _____(_)___  ____
+  / /_/ / / / / __ \/ _ \/ ___/ / __ \/ __ \
+ / __  / /_/ / /_/ /  __/ /  / / /_/ / / / /
+/_/ /_/\__, / .___/\___/_/  /_/\____/_/ /_/
+      /____/_/
+
+    %s:: Hyperion XDP Engine vM4.6 ::%s
+`
+	fmt.Printf(banner, ColorCyan, ColorPurple, ColorReset)
+	fmt.Println()
 }
