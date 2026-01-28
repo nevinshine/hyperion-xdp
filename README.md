@@ -1,10 +1,8 @@
-# Project Hyperion: Datapath Security Research
+Here is the professional, emoji-free **README.md** for Hyperion. It reflects the current stable architecture (vM4.6), includes the requested GIF asset path, and documents the complete version history as requested.
 
-![Status](https://img.shields.io/badge/Status-M3.0_DPI_Engine-blueviolet?style=flat-square)
-![Layer](https://img.shields.io/badge/Layer-Kernel_Datapath_(XDP)-blue?style=flat-square)
-![Role](https://img.shields.io/badge/Role-Network_Satellite-blueviolet?style=flat-square)
-![License](https://img.shields.io/badge/License-GPLv2_%2F_MIT-lightgrey?style=flat-square)
-![Author](https://img.shields.io/badge/Author-Nevin-orange?style=flat-square)
+---
+
+# Project Hyperion: Datapath Security Research
 
 **Hyperion** is a high-performance network security engine designed to enforce content-aware policy at the NIC driver level. Unlike traditional firewalls that operate at the socket layer (Netfilter), Hyperion uses **eBPF (Extended Berkeley Packet Filter)** and **XDP (Express Data Path)** to reject malicious payloads before the Linux Kernel allocates memory.
 
@@ -17,6 +15,7 @@
 Modern endpoint security focuses heavily on process-level control (syscalls). However, by the time a packet reaches a process, the kernel has already consumed significant resources parsing headers and managing buffers.
 
 **The Research Question**
+
 > *Can we inspect packet payloads for malicious signatures at wire speed (O(N)), dropping threats before the OS commits resources?*
 
 ### The "Two Towers" Architecture
@@ -24,7 +23,7 @@ Modern endpoint security focuses heavily on process-level control (syscalls). Ho
 Hyperion complements Sentinel by securing the transport boundary.
 
 | Dimension | Sentinel (The Host) | Hyperion (The Wire) |
-| :--- | :--- | :--- |
+| --- | --- | --- |
 | **Boundary** | Process Execution | Network Transport |
 | **Mechanism** | `ptrace` / Kernel Modules | `eBPF` / `XDP` |
 | **Visibility** | Syscalls (`execve`, `open`) | Payloads (`GET /hack HTTP/1.1`) |
@@ -35,18 +34,28 @@ Hyperion complements Sentinel by securing the transport boundary.
 
 ## System Architecture
 
-Hyperion operates on a split-plane design, utilizing the driver's interrupt context for maximum throughput.
+Hyperion operates on a split-plane design, utilizing the driver's interrupt context for maximum throughput. The vM4.6 architecture introduces dynamic policy maps and ring-buffer telemetry to decouple inspection from configuration.
 
 ```mermaid
 graph TD
-    A[Attacker] -->|Malicious Packet| B(Network Interface / NIC)
-    B -->|XDP Hook| C{Hyperion M3 Engine}
-    C -->|Parse Headers| D[Ethernet -> IP -> TCP]
-    D -->|Pointer Arithmetic| E[Locate Payload]
-    E -->|Linear Scan| F{Signature Match?}
-    F -- "hack" Detected --> G[XDP_DROP]
-    F -- Clean --> H[XDP_PASS to Kernel]
-    G -.-> I[Trace Pipe Log]
+    A[Attacker] -->|Malicious Packet| B(Network Interface)
+    B -->|XDP Hook| C{Hyperion Engine}
+    
+    %% Dynamic Policy Flow
+    U[User Controller] -.->|Update Map| P[(Policy Map)]
+    P -.->|Read Rule| C
+    
+    C -->|Parse L2-L4| D[Locate Payload]
+    D -->|DPI Scan| E{Signature Match?}
+    
+    %% Decision Flow
+    E -- Match --> F[XDP_DROP]
+    E -- Clean --> G[XDP_PASS]
+    
+    %% Telemetry Flow
+    F -.->|Push Event| R[(Ring Buffer)]
+    R -.->|Poll & Decode| U
+    U -->|ALERT LOG| L[Console Output]
 
 ```
 
@@ -54,17 +63,25 @@ graph TD
 
 * **Technology:** Restricted C (eBPF).
 * **Role:** Parses Layer 7 payloads directly in the driver.
-* **M3 Capability:** **Deep Packet Inspection (DPI)**. Implements a bounded loop (`#pragma unroll`) to scan TCP payload bytes for the signature `hack`.
-* **Performance:** Zero-Copy drop. The packet is discarded without ever creating an `skb` structure.
+* **Capabilities:** * **Dynamic Inspection:** Reads signatures from `BPF_MAP_TYPE_ARRAY` instead of hardcoded strings.
+* **Telemetry:** Streams structured binary events via `BPF_MAP_TYPE_RINGBUF`.
+* **Safety:** Implements bounded loops (32-byte window) to satisfy BPF verifier complexity limits.
+
+
 
 ### 2. User Space Controller (`src/user/`)
 
 * **Technology:** Go (Cilium eBPF Library).
-* **Role:** Loads the XDP program, manages lifecycle, and provides a colored CLI for status monitoring.
+* **Role:** Orchestrates the BPF lifecycle.
+* **Loader:** Injects policies from configuration files.
+* **Monitor:** Asynchronously polls the ring buffer for alerts.
+* **Manager:** Handles `SIGHUP` signals for zero-downtime updates.
+
+
 
 ---
 
-## Research Roadmap
+## Version History & Roadmap
 
 We define success through distinct capability milestones.
 
@@ -83,16 +100,26 @@ We define success through distinct capability milestones.
 * **Goal:** Implement stateful logic (Rate Limiting) in BPF Maps.
 * **Outcome:** System successfully detected volumetric floods using `BPF_MAP_TYPE_LRU_HASH`.
 
-### [Phase M3] Deep Packet Inspection (Current Status)
+### [Phase M3] Static DPI (Complete)
 
 * **Goal:** Implement Layer 7 Payload Analysis in XDP.
-* **Validation:** Custom logic scans TCP payloads for signature `hack`.
+* **Validation:** Custom logic scans TCP payloads for static signatures.
 * **Outcome:** Malicious packets are dropped instantly; standard HTTP traffic passes.
-* **Metric:** Successfully blocked `netcat` attacks while allowing standard traffic.
 
-### [Phase M4] Dynamic Policy (Next)
+### [Phase M4] Dynamic Policy (Stable Release)
 
-* **Goal:** Allow User Space to update signatures dynamically via Maps.
+* **Goal:** Decouple policy from code.
+* **Outcome:** Implemented `BPF_MAP_TYPE_ARRAY` for runtime signature updates via CLI/Config.
+* **Feature:** Zero-downtime reloads via `SIGHUP`.
+
+### [Phase M5] Telemetry & Flow State (Current Research)
+
+* **Goal:** Production observability and flow-aware context.
+* **Status:** Ring Buffer telemetry active. Researching `LRU_HASH` for 5-tuple flow tracking to mitigate split-packet evasion.
+
+### [Phase M6] Enterprise Integration (Future)
+
+* **Goal:** Distributed policy synchronization and TLS-offload integration.
 
 ---
 
@@ -103,35 +130,43 @@ We define success through distinct capability milestones.
 * Linux Kernel 5.4+ (BTF Support)
 * `clang`, `llvm`, `make`, `golang`
 
-### Quick Start (M3.0)
+### Quick Start (vM4.6)
 
-Hyperion M3 uses a Go-based controller for reliable loading.
+Hyperion uses a Go-based controller for reliable loading and visualization.
 
 ```bash
 # 1. Compile the Engine
 make
 
-# 2. Attach to Interface (e.g., lo or wlp1s0)
+# 2. Configure Signatures
+echo "root" > signatures.txt
+echo "hack" >> signatures.txt
+
+# 3. Attach to Interface (e.g., lo or wlp1s0)
 sudo ./bin/hyperion_ctrl -iface lo
 
 ```
 
-### Verification (The "Live Fire" Test)
+### Operational Guide
 
-**Terminal 1 (Monitor):**
+**Live Configuration Reload**
+Modify `signatures.txt` while the engine is running and trigger a reload signal:
 
 ```bash
-sudo cat /sys/kernel/debug/tracing/trace_pipe
-
+# Find the PID printed on startup
+sudo kill -HUP <PID>
 ```
 
-**Terminal 2 (Attack):**
+**Verification**
+Attempt to send a malicious payload:
 
 ```bash
 # This packet will be DROPPED by Hyperion
-echo "hack" | nc -w 1 127.0.0.1 8080
-
+echo "root" | nc 127.0.0.1 8080
 ```
+**Live Demo:**
+
+![Hyperion Demo](assets/hyperion_demo.gif)
 
 ---
 
