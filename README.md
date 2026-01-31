@@ -84,8 +84,7 @@ We define success through distinct capability milestones.
 
 **Live Verification:** The system drops a payload containing the signature "root" and then dynamically reloads to block "admin" without restarting.
 
-[](https://asciinema.org/a/ShlOWFRxuQABuwp4)
-*(Click to play the forensic session recording)*
+[![asciicast](https://asciinema.org/a/ShlOWFRxuQABuwp4.svg)](https://asciinema.org/a/ShlOWFRxuQABuwp4)
 
 ---
 
