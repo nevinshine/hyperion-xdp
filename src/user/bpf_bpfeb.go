@@ -16,8 +16,9 @@ import (
 type bpfPolicyT struct {
 	_         structs.HostLayout
 	Signature [8]uint8
-	SigLen    uint32
-	Active    uint32
+	SigLen    uint8
+	Active    uint8
+	Pad       [2]uint8
 }
 
 // loadBpf returns the embedded CollectionSpec for bpf.

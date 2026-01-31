@@ -1,3 +1,5 @@
+# Hyperion XDP: Kernel-Space Defense Engine
+
 ```console
 root@Hyperion-Edge:~# ./hyperion_ctrl --load --interface=eth0
 
@@ -12,15 +14,15 @@ root@Hyperion-Edge:~# ./hyperion_ctrl --load --interface=eth0
   ██╔══██║  ╚██╔╝  ██╔═══╝ ██╔══╝  ██╔══██╗██║██║   ██║██║╚██╗██║
   ██║  ██║   ██║   ██║     ███████╗██║  ██║██║╚██████╔╝██║ ╚████║
   ╚═╝  ╚═╝   ╚═╝   ╚═╝     ╚══════╝╚═╝  ╚═╝╚═╝ ╚═════╝ ╚═╝  ╚═══╝
-  
+   
   >> EBPF/XDP HIGH-PERFORMANCE PACKET FILTER <<
 
   [RUNTIME STATUS]
-  > VERSION:       vM4.6 (Dynamic Policy + Ring Buffer)
-  > ENGINE:        eBPF/XDP (Restricted C)
-  > CONTROLLER:    Go (Cilium Library)
-  > LICENSE:       GPLv2 (Kern) / MIT (User)
-  > TARGET:        MSc Cybersecurity Research Artifact
+  > MILESTONE:      M4.6 (Dynamic Policy + Ring Buffer)
+  > ENGINE:         eBPF/XDP (Restricted C)
+  > CONTROLLER:     Go (Cilium Library)
+  > LICENSE:        GPLv2 (Kern) / MIT (User)
+  > TARGET:         MSc Cybersecurity Research Artifact
 
 ```
 
@@ -28,7 +30,7 @@ root@Hyperion-Edge:~# ./hyperion_ctrl --load --interface=eth0
 
 ## [ 0x01 ] ABSTRACT
 
-**Hyperion** is a high-performance network security engine designed to enforce content-aware policy at the NIC driver level. Unlike traditional firewalls that operate at the socket layer (Netfilter), Hyperion uses **eBPF (Extended Berkeley Packet Filter)** and **XDP (Express Data Path)** to reject malicious payloads before the Linux Kernel allocates memory.
+**Hyperion** is a high-performance network security engine designed to enforce content-aware policy at the NIC driver level. Unlike traditional firewalls that operate at the socket layer (Netfilter), Hyperion uses **eBPF (Extended Berkeley Packet Filter)** and **XDP (Express Data Path)** to reject malicious payloads before the Linux Kernel allocates memory (sk_buff).
 
 > **Research Context:** This project serves as the Network Satellite to the [Sentinel Runtime](https://github.com/nevinshine/sentinel-runtime) (Host Anchor). It explores the unification of process-level and packet-level defense.
 
@@ -57,9 +59,9 @@ Hyperion complements Sentinel by securing the transport boundary.
 
 | COMPONENT | TECH STACK | RESPONSIBILITY |
 | --- | --- | --- |
-| **KERNEL ENFORCER** | Restricted C | **The Muscle.** Parses Layer 7 payloads in the driver. Implements bounded loops (32-byte window) for BPF safety. |
-| **USER CONTROLLER** | Go (Cilium) | **The Brain.** Orchestrates BPF lifecycle. Handles `SIGHUP` for zero-downtime policy reloads. |
-| **TELEMETRY** | Ring Buffer | **The Nerves.** Streams structured binary events from Kernel to User Space. |
+| **KERNEL ENFORCER** | Restricted C | **The Muscle.** Parses Layer 7 payloads in the driver. Implements verifier-safe bounded loops for Deep Packet Inspection (DPI). |
+| **USER CONTROLLER** | Go (Cilium) | **The Brain.** Orchestrates BPF lifecycle. Handles `SIGHUP` for zero-downtime policy reloads via BPF Maps. |
+| **TELEMETRY** | Ring Buffer | **The Nerves.** Streams structured binary events from Kernel to User Space for forensic logging. |
 
 ---
 
@@ -73,16 +75,17 @@ We define success through distinct capability milestones.
 | **M1** | Stateless Filtering | ✅ | Validated `XDP_DROP` against hardcoded IP targets. |
 | **M2** | Stateful Tracking | ✅ | Volumetric flood detection via `BPF_MAP_TYPE_LRU_HASH`. |
 | **M3** | Static DPI | ✅ | Layer 7 Payload Analysis scanning for signatures. |
-| **M4** | Dynamic Policy | ✅ | **[STABLE]** Runtime updates via `BPF_MAP_TYPE_ARRAY` & CLI. |
+| **M4** | Dynamic Policy | ✅ | **[COMPLETED]** Hot-swappable rules via `BPF_MAP_TYPE_ARRAY` & SIGHUP. |
 | **M5** | Telemetry | 🔄 | **[CURRENT]** Ring Buffer active. Researching 5-tuple flow tracking. |
 
 ---
 
 ## [ 0x04 ] DEMO ARTIFACT
 
-**Live Verification:** The system drops a payload containing the signature "root" while allowing normal traffic.
+**Live Verification:** The system drops a payload containing the signature "root" and then dynamically reloads to block "admin" without restarting.
 
-[Hyperion Demo](assets/hyperion_demo.gif)
+[](https://asciinema.org/a/ShlOWFRxuQABuwp4)
+*(Click to play the forensic session recording)*
 
 ---
 
@@ -101,20 +104,23 @@ make
 
 # 2. Configure Signatures
 echo "root" > signatures.txt
-echo "hack" >> signatures.txt
+echo "admin" >> signatures.txt
 
 # 3. Attach to Interface (e.g., lo or wlp1s0)
-sudo ./bin/hyperion_ctrl -iface lo
+sudo ./bin/hyperion_ctrl -iface wlp1s0
 
 ```
 
-### Dynamic Reload
+### Dynamic Reload (Zero Downtime)
 
-Modify `signatures.txt` while the engine is running and trigger a hot-reload:
+Modify `signatures.txt` while the engine is running and trigger a hot-reload using `pkill`. The engine will update the BPF Map instantly.
 
 ```bash
-# Find the PID printed on startup and send SIGHUP
-sudo kill -HUP <PID>
+# Update rules
+echo "malware" >> signatures.txt
+
+# Send Signal to Hyperion Controller
+sudo pkill -HUP hyperion_ctrl
 
 ```
 
