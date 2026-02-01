@@ -314,7 +314,7 @@ func calculateBootTimeOffset() error {
     if err != nil {
         return fmt.Errorf("failed to read /proc/uptime: %w", err)
     }
-    
+
     // /proc/uptime contains two numbers: uptime in seconds and idle time
     // We only need the first number
     var uptimeSeconds float64
@@ -322,13 +322,13 @@ func calculateBootTimeOffset() error {
     if err != nil {
         return fmt.Errorf("failed to parse /proc/uptime: %w", err)
     }
-    
+
     // Convert uptime to nanoseconds
     bootTimeNs := int64(uptimeSeconds * 1e9)
-    
+
     // Calculate offset: current Unix time - boot time
     bootTimeOffset = time.Now().UnixNano() - bootTimeNs
-    
+
     return nil
 }
 
@@ -338,7 +338,7 @@ func formatTelemetryEvent(event *HypEvent) string {
     // bpf_ktime_get_ns() returns nanoseconds since boot, so we add our offset
     t := time.Unix(0, int64(event.Timestamp)+bootTimeOffset)
     timestamp := t.Format("2006-01-02 15:04:05")
-    
+
     // Convert IPs
     srcIP := int2ip(event.SrcIP)
     dstIP := int2ip(event.DstIP)
