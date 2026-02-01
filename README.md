@@ -22,7 +22,7 @@ root@Hyperion-Edge:~# ./hyperion_ctrl --load --interface=eth0
   > ENGINE:         eBPF/XDP (Restricted C)
   > CONTROLLER:     Go (Cilium Library)
   > LICENSE:        GPLv2 (Kern) / MIT (User)
-  > TARGET:         MSc Cybersecurity Research Artifact
+  > TARGET:         Cybersecurity Research Artifact
 
 ```
 
