@@ -76,7 +76,7 @@ We define success through distinct capability milestones.
 | **M2** | Stateful Tracking | ✅ | Volumetric flood detection via `BPF_MAP_TYPE_LRU_HASH`. |
 | **M3** | Static DPI | ✅ | Layer 7 Payload Analysis scanning for signatures. |
 | **M4** | Dynamic Policy | ✅ | **[COMPLETED]** Hot-swappable rules via `BPF_MAP_TYPE_ARRAY` & SIGHUP. |
-| **M5** | Telemetry | 🔄 | **[CURRENT]** Ring Buffer active. Researching 5-tuple flow tracking. |
+| **M5** | Telemetry | ✅ | **[COMPLETED]** Ring Buffer telemetry with 5-tuple flow tracking. |
 
 ---
 
@@ -95,7 +95,7 @@ We define success through distinct capability milestones.
 * Linux Kernel 5.4+ (BTF Support)
 * `clang`, `llvm`, `make`, `golang`
 
-### Quick Start (vM4.6)
+### Quick Start (vM5)
 
 ```bash
 # 1. Compile the Engine
@@ -107,6 +107,12 @@ echo "admin" >> signatures.txt
 
 # 3. Attach to Interface (e.g., lo or wlp1s0)
 sudo ./bin/hyperion_ctrl -iface wlp1s0
+
+# 4. Enable Telemetry (Optional)
+sudo ./bin/hyperion_ctrl -iface wlp1s0 -telemetry
+
+# 5. Enable Telemetry with File Logging (Optional)
+sudo ./bin/hyperion_ctrl -iface wlp1s0 -telemetry -logfile /var/log/hyperion.log
 
 ```
 
@@ -122,6 +128,14 @@ echo "malware" >> signatures.txt
 sudo pkill -HUP hyperion_ctrl
 
 ```
+
+### Telemetry
+
+See [docs/TELEMETRY.md](docs/TELEMETRY.md) for detailed information about:
+- Event types and schema
+- 5-tuple flow tracking
+- CLI usage and options
+- API reference for telemetry consumers
 
 ---
 

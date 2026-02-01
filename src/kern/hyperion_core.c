@@ -15,6 +15,35 @@ struct policy_t {
     __u8 _pad[2]; 
 };
 
+// M5: New telemetry event structure
+struct hyp_event {
+    __u8 event_type;    // 0=ACCEPT, 1=DROP, 2=SIG_MATCH
+    __u32 src_ip;
+    __u32 dst_ip;
+    __u16 src_port;
+    __u16 dst_port;
+    __u8 protocol;
+    __u64 timestamp;
+    char signature[8];  // matched signature (if any)
+};
+
+// M5: Flow tracking structures
+struct flow_key {
+    __u32 src_ip;
+    __u32 dst_ip;
+    __u16 src_port;
+    __u16 dst_port;
+    __u8 protocol;
+};
+
+struct flow_value {
+    __u64 packets;
+    __u64 bytes;
+    __u64 first_seen;
+    __u64 last_seen;
+};
+
+// Legacy event structure (kept for compatibility)
 struct event_t {
     __u32 src_ip;
     __u32 dst_ip;
@@ -35,6 +64,20 @@ struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 1 << 14); 
 } alert_ringbuf SEC(".maps");
+
+// M5: Ring buffer for telemetry events
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 1 << 16); // 64KB for telemetry
+} telemetry_ringbuf SEC(".maps");
+
+// M5: Flow tracking map
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __type(key, struct flow_key);
+    __type(value, struct flow_value);
+    __uint(max_entries, 10000);
+} flow_map SEC(".maps");
 
 struct cursor {
     void *pos;
@@ -67,6 +110,33 @@ int hyperion_filter(struct xdp_md *ctx) {
     if ((void *)(tcp + 1) > c.end) return XDP_PASS;
     c.pos += tcp->doff * 4;
     
+    // M5: Update flow tracking
+    struct flow_key fkey = {};
+    fkey.src_ip = ip->saddr;
+    fkey.dst_ip = ip->daddr;
+    fkey.src_port = tcp->source;
+    fkey.dst_port = tcp->dest;
+    fkey.protocol = ip->protocol;
+    
+    __u64 now = bpf_ktime_get_ns();
+    __u32 pkt_len = (__u32)((__u64)c.end - (__u64)ctx->data);
+    
+    struct flow_value *fval = bpf_map_lookup_elem(&flow_map, &fkey);
+    if (fval) {
+        // Update existing flow
+        __sync_fetch_and_add(&fval->packets, 1);
+        __sync_fetch_and_add(&fval->bytes, pkt_len);
+        fval->last_seen = now;
+    } else {
+        // Create new flow entry
+        struct flow_value new_fval = {};
+        new_fval.packets = 1;
+        new_fval.bytes = pkt_len;
+        new_fval.first_seen = now;
+        new_fval.last_seen = now;
+        bpf_map_update_elem(&flow_map, &fkey, &new_fval, BPF_ANY);
+    }
+    
     // 4. Payload
     void *payload_start = c.pos;
     // VERIFIER FIX: Explicit pointer check instead of math
@@ -92,7 +162,26 @@ int hyperion_filter(struct xdp_md *ctx) {
             data[2] == pol->signature[2] &&
             data[3] == pol->signature[3]) {
             
-            // Found a match! Trigger Alert
+            // M5: Emit SIG_MATCH telemetry event
+            struct hyp_event *evt = bpf_ringbuf_reserve(&telemetry_ringbuf, sizeof(*evt), 0);
+            if (evt) {
+                evt->event_type = 2; // SIG_MATCH
+                evt->src_ip = ip->saddr;
+                evt->dst_ip = ip->daddr;
+                evt->src_port = tcp->source;
+                evt->dst_port = tcp->dest;
+                evt->protocol = ip->protocol;
+                evt->timestamp = now;
+                
+                // Copy matched signature
+                #pragma unroll
+                for (int k = 0; k < 8; k++) {
+                    evt->signature[k] = pol->signature[k];
+                }
+                bpf_ringbuf_submit(evt, 0);
+            }
+            
+            // Found a match! Trigger Alert (legacy)
             struct event_t *e = bpf_ringbuf_reserve(&alert_ringbuf, sizeof(*e), 0);
             if (e) {
                 e->src_ip = ip->saddr;
@@ -111,8 +200,47 @@ int hyperion_filter(struct xdp_md *ctx) {
                 }
                 bpf_ringbuf_submit(e, 0);
             }
+            
+            // M5: Emit DROP telemetry event
+            evt = bpf_ringbuf_reserve(&telemetry_ringbuf, sizeof(*evt), 0);
+            if (evt) {
+                evt->event_type = 1; // DROP
+                evt->src_ip = ip->saddr;
+                evt->dst_ip = ip->daddr;
+                evt->src_port = tcp->source;
+                evt->dst_port = tcp->dest;
+                evt->protocol = ip->protocol;
+                evt->timestamp = now;
+                
+                // Copy matched signature for context
+                #pragma unroll
+                for (int k = 0; k < 8; k++) {
+                    evt->signature[k] = pol->signature[k];
+                }
+                bpf_ringbuf_submit(evt, 0);
+            }
+            
             return XDP_DROP;
         }
+    }
+
+    // M5: Emit ACCEPT telemetry event for packets that pass
+    struct hyp_event *evt = bpf_ringbuf_reserve(&telemetry_ringbuf, sizeof(*evt), 0);
+    if (evt) {
+        evt->event_type = 0; // ACCEPT
+        evt->src_ip = ip->saddr;
+        evt->dst_ip = ip->daddr;
+        evt->src_port = tcp->source;
+        evt->dst_port = tcp->dest;
+        evt->protocol = ip->protocol;
+        evt->timestamp = now;
+        
+        // No signature for ACCEPT events
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            evt->signature[k] = 0;
+        }
+        bpf_ringbuf_submit(evt, 0);
     }
 
     return XDP_PASS;

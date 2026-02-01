@@ -1,4 +1,4 @@
-/* HYPERION CONTROLLER M4.6 (Visual Upgrade) */
+/* HYPERION CONTROLLER M5 (Telemetry + Flow Tracking) */
 package main
 
 import (
@@ -14,6 +14,7 @@ import (
     "strings"
     "syscall"
     "time"
+    "unsafe"
 
     "github.com/cilium/ebpf"
     "github.com/cilium/ebpf/link"
@@ -46,6 +47,18 @@ type Policy struct {
     Pad       [2]uint8 // FIXED: Aligns to 12 bytes
 }
 
+// M5: New telemetry event structure (must match struct hyp_event)
+type HypEvent struct {
+    EventType uint8    // 0=ACCEPT, 1=DROP, 2=SIG_MATCH
+    SrcIP     uint32
+    DstIP     uint32
+    SrcPort   uint16
+    DstPort   uint16
+    Protocol  uint8
+    Timestamp uint64
+    Signature [8]byte
+}
+
 // Must match Kernel Struct (struct event_t)
 type AlertEvent struct {
     SrcIP   uint32
@@ -64,6 +77,8 @@ func main() {
     // Default to 'wlp1s0' if not specified
     ifaceName := flag.String("iface", "wlp1s0", "Interface to attach XDP")
     sigFlag := flag.String("sig", "", "Comma-separated signatures (e.g., -sig \"hack,malware,evil\")")
+    telemetryFlag := flag.Bool("telemetry", false, "Enable telemetry event output")
+    logfileFlag := flag.String("logfile", "", "Optional file for logging events")
     flag.Parse()
 
     printBanner()
@@ -99,18 +114,41 @@ func main() {
     }
     defer l.Close()
 
-    // 4. Telemetry Loop
+    // 4. Setup optional log file
+    var logFile *os.File
+    if *logfileFlag != "" {
+        logFile, err = os.OpenFile(*logfileFlag, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+        if err != nil {
+            log.Fatalf("%s[!] Failed to open log file: %v%s", ColorRed, err, ColorReset)
+        }
+        defer logFile.Close()
+        fmt.Printf("%s[+] Logging events to: %s%s\n", ColorGreen, *logfileFlag, ColorReset)
+    }
+
+    // 5. Legacy Telemetry Loop (alert_ringbuf)
     rd, err := ringbuf.NewReader(objs.AlertRingbuf)
     if err != nil {
         log.Fatalf("%s[!] Ringbuf failed: %v%s", ColorRed, err, ColorReset)
     }
     defer rd.Close()
 
+    // 6. M5: New Telemetry Loop (telemetry_ringbuf)
+    var telemetryReader *ringbuf.Reader
+    if *telemetryFlag {
+        telemetryReader, err = ringbuf.NewReader(objs.TelemetryRingbuf)
+        if err != nil {
+            log.Fatalf("%s[!] Telemetry Ringbuf failed: %v%s", ColorRed, err, ColorReset)
+        }
+        defer telemetryReader.Close()
+        fmt.Printf("%s[+] Telemetry enabled%s\n", ColorGreen, ColorReset)
+    }
+
     fmt.Printf("%s[+] Hyperion Active on %s%s\n", ColorGreen, *ifaceName, ColorReset)
     fmt.Printf("%s[i] PID: %d (Run 'kill -HUP %d' to reload)%s\n", ColorCyan, os.Getpid(), os.Getpid(), ColorReset)
     fmt.Println(strings.Repeat("-", 60))
     fmt.Printf("%sWaiting for threats...%s\n", ColorWhite, ColorReset)
 
+    // Legacy alert handler
     go func() {
         for {
             record, err := rd.Read()
@@ -145,7 +183,39 @@ func main() {
         }
     }()
 
-    // 5. Signal Handling
+    // M5: Telemetry event handler
+    if *telemetryFlag {
+        go func() {
+            for {
+                record, err := telemetryReader.Read()
+                if err != nil {
+                    if err == ringbuf.ErrClosed {
+                        return
+                    }
+                    continue
+                }
+
+                var event HypEvent
+                if err := binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &event); err != nil {
+                    log.Printf("Failed to parse telemetry event: %v", err)
+                    continue
+                }
+
+                // Format the event
+                eventStr := formatTelemetryEvent(&event)
+                
+                // Print to stdout
+                fmt.Println(eventStr)
+                
+                // Optionally write to log file
+                if logFile != nil {
+                    fmt.Fprintln(logFile, eventStr)
+                }
+            }
+        }()
+    }
+
+    // 7. Signal Handling
     sigChan := make(chan os.Signal, 1)
     signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 
@@ -229,6 +299,67 @@ func int2ip(nn uint32) net.IP {
     return ip
 }
 
+// M5: Format telemetry event for display
+func formatTelemetryEvent(event *HypEvent) string {
+    // Convert timestamp from nanoseconds to time
+    t := time.Unix(0, int64(event.Timestamp))
+    timestamp := t.Format("2006-01-02 15:04:05")
+    
+    // Convert IPs
+    srcIP := int2ip(event.SrcIP)
+    dstIP := int2ip(event.DstIP)
+    
+    // Convert ports (they are in network byte order)
+    srcPort := binary.BigEndian.Uint16((*(*[2]byte)(unsafe.Pointer(&event.SrcPort)))[:])
+    dstPort := binary.BigEndian.Uint16((*(*[2]byte)(unsafe.Pointer(&event.DstPort)))[:])
+    
+    // Determine protocol name
+    protoName := "UNKNOWN"
+    switch event.Protocol {
+    case 6:
+        protoName = "TCP"
+    case 17:
+        protoName = "UDP"
+    }
+    
+    // Determine event type
+    eventType := ""
+    eventColor := ColorWhite
+    switch event.EventType {
+    case 0:
+        eventType = "ACCEPT"
+        eventColor = ColorGreen
+    case 1:
+        eventType = "DROP"
+        eventColor = ColorRed
+    case 2:
+        eventType = "SIG_MATCH"
+        eventColor = ColorYellow
+    }
+    
+    // Format signature if present
+    sigStr := ""
+    if event.EventType == 1 || event.EventType == 2 {
+        // Extract signature (null-terminated or fixed 8 bytes)
+        sig := bytes.TrimRight(event.Signature[:], "\x00")
+        if len(sig) > 0 {
+            sigStr = fmt.Sprintf(" sig=\"%s\"", string(sig))
+        }
+    }
+    
+    return fmt.Sprintf("[%s] %s%s%s %s:%d -> %s:%d %s%s",
+        timestamp,
+        eventColor,
+        eventType,
+        ColorReset,
+        srcIP,
+        srcPort,
+        dstIP,
+        dstPort,
+        protoName,
+        sigStr)
+}
+
 func printBanner() {
     banner := `
 %s    __  __                      _
@@ -238,7 +369,7 @@ func printBanner() {
 /_/ /_/\__, / .___/\___/_/  /_/\____/_/ /_/
       /____/_/
 
-    %s:: Hyperion XDP Engine vM4.6 ::%s
+    %s:: Hyperion XDP Engine vM5 (Telemetry) ::%s
 `
     fmt.Printf(banner, ColorCyan, ColorPurple, ColorReset)
     fmt.Println()

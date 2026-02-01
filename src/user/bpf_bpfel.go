@@ -13,6 +13,24 @@ import (
 	"github.com/cilium/ebpf"
 )
 
+type bpfFlowKey struct {
+	_        structs.HostLayout
+	SrcIp    uint32
+	DstIp    uint32
+	SrcPort  uint16
+	DstPort  uint16
+	Protocol uint8
+	_        [3]byte
+}
+
+type bpfFlowValue struct {
+	_         structs.HostLayout
+	Packets   uint64
+	Bytes     uint64
+	FirstSeen uint64
+	LastSeen  uint64
+}
+
 type bpfPolicyT struct {
 	_         structs.HostLayout
 	Signature [8]uint8
@@ -70,8 +88,10 @@ type bpfProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type bpfMapSpecs struct {
-	AlertRingbuf *ebpf.MapSpec `ebpf:"alert_ringbuf"`
-	PolicyMap    *ebpf.MapSpec `ebpf:"policy_map"`
+	AlertRingbuf     *ebpf.MapSpec `ebpf:"alert_ringbuf"`
+	FlowMap          *ebpf.MapSpec `ebpf:"flow_map"`
+	PolicyMap        *ebpf.MapSpec `ebpf:"policy_map"`
+	TelemetryRingbuf *ebpf.MapSpec `ebpf:"telemetry_ringbuf"`
 }
 
 // bpfVariableSpecs contains global variables before they are loaded into the kernel.
@@ -100,14 +120,18 @@ func (o *bpfObjects) Close() error {
 //
 // It can be passed to loadBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type bpfMaps struct {
-	AlertRingbuf *ebpf.Map `ebpf:"alert_ringbuf"`
-	PolicyMap    *ebpf.Map `ebpf:"policy_map"`
+	AlertRingbuf     *ebpf.Map `ebpf:"alert_ringbuf"`
+	FlowMap          *ebpf.Map `ebpf:"flow_map"`
+	PolicyMap        *ebpf.Map `ebpf:"policy_map"`
+	TelemetryRingbuf *ebpf.Map `ebpf:"telemetry_ringbuf"`
 }
 
 func (m *bpfMaps) Close() error {
 	return _BpfClose(
 		m.AlertRingbuf,
+		m.FlowMap,
 		m.PolicyMap,
+		m.TelemetryRingbuf,
 	)
 }
 
