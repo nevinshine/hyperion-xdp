@@ -14,7 +14,6 @@ import (
     "strings"
     "syscall"
     "time"
-    "unsafe"
 
     "github.com/cilium/ebpf"
     "github.com/cilium/ebpf/link"
@@ -50,11 +49,13 @@ type Policy struct {
 // M5: New telemetry event structure (must match struct hyp_event)
 type HypEvent struct {
     EventType uint8    // 0=ACCEPT, 1=DROP, 2=SIG_MATCH
+    _         [3]uint8 // Padding for alignment
     SrcIP     uint32
     DstIP     uint32
     SrcPort   uint16
     DstPort   uint16
     Protocol  uint8
+    _         [7]uint8 // Padding for 8-byte alignment before Timestamp
     Timestamp uint64
     Signature [8]byte
 }
@@ -309,9 +310,9 @@ func formatTelemetryEvent(event *HypEvent) string {
     srcIP := int2ip(event.SrcIP)
     dstIP := int2ip(event.DstIP)
     
-    // Convert ports (they are in network byte order)
-    srcPort := binary.BigEndian.Uint16((*(*[2]byte)(unsafe.Pointer(&event.SrcPort)))[:])
-    dstPort := binary.BigEndian.Uint16((*(*[2]byte)(unsafe.Pointer(&event.DstPort)))[:])
+    // Convert ports from network byte order (big endian) to host byte order
+    srcPort := binary.BigEndian.Uint16([]byte{byte(event.SrcPort >> 8), byte(event.SrcPort)})
+    dstPort := binary.BigEndian.Uint16([]byte{byte(event.DstPort >> 8), byte(event.DstPort)})
     
     // Determine protocol name
     protoName := "UNKNOWN"

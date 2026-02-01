@@ -18,11 +18,13 @@ struct policy_t {
 // M5: New telemetry event structure
 struct hyp_event {
     __u8 event_type;    // 0=ACCEPT, 1=DROP, 2=SIG_MATCH
+    __u8 _pad1[3];      // Padding for alignment
     __u32 src_ip;
     __u32 dst_ip;
     __u16 src_port;
     __u16 dst_port;
     __u8 protocol;
+    __u8 _pad2[7];      // Padding for 8-byte alignment before timestamp
     __u64 timestamp;
     char signature[8];  // matched signature (if any)
 };
@@ -119,7 +121,10 @@ int hyperion_filter(struct xdp_md *ctx) {
     fkey.protocol = ip->protocol;
     
     __u64 now = bpf_ktime_get_ns();
-    __u32 pkt_len = (__u32)((__u64)c.end - (__u64)ctx->data);
+    // Calculate packet length from data pointers
+    void *data_start = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
+    __u32 pkt_len = data_end - data_start;
     
     struct flow_value *fval = bpf_map_lookup_elem(&flow_map, &fkey);
     if (fval) {

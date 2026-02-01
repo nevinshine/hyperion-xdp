@@ -25,30 +25,38 @@ Hyperion emits three types of telemetry events:
 ```c
 struct hyp_event {
     __u8 event_type;    // 0=ACCEPT, 1=DROP, 2=SIG_MATCH
+    __u8 _pad1[3];      // Padding for alignment
     __u32 src_ip;       // Source IP address (network byte order)
     __u32 dst_ip;       // Destination IP address (network byte order)
     __u16 src_port;     // Source port (network byte order)
     __u16 dst_port;     // Destination port (network byte order)
     __u8 protocol;      // IP protocol (6=TCP, 17=UDP)
+    __u8 _pad2[7];      // Padding for 8-byte alignment before timestamp
     __u64 timestamp;    // Event timestamp (nanoseconds since epoch)
     char signature[8];  // Matched signature (if any)
 };
 ```
+
+**Total Size:** 40 bytes (with explicit padding for alignment)
 
 ### Go Structure (`HypEvent`)
 
 ```go
 type HypEvent struct {
     EventType uint8    // 0=ACCEPT, 1=DROP, 2=SIG_MATCH
+    _         [3]uint8 // Padding for alignment
     SrcIP     uint32
     DstIP     uint32
     SrcPort   uint16
     DstPort   uint16
     Protocol  uint8
+    _         [7]uint8 // Padding for 8-byte alignment before Timestamp
     Timestamp uint64
     Signature [8]byte
 }
 ```
+
+**Total Size:** 40 bytes (matches C struct exactly)
 
 ---
 
