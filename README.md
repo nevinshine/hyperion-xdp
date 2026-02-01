@@ -82,32 +82,25 @@ We define success through distinct capability milestones.
 
 ## [ 0x04 ] RESEARCH & ENGINEERING CHALLENGES
 
-### 1. Verifier-Safe Deep Packet Inspection (DPI)
+### Kernel Verifier Constraints
 
-The BPF Verifier enforces a strict instruction limit and forbids indeterminate loops. Implementing payload matching for signatures like "root" required:
+The eBPF verifier enforces strict safety guarantees, creating unique engineering challenges:
 
-- **Loop Unrolling:** Utilizing `#pragma unroll` to satisfy the verifier's requirement for bounded execution.
-- **Pointer Arithmetic Validation:** Implementing rigorous bounds checking against `data_end` to prevent out-of-bounds memory access during L7 inspection.
+* **Bounded Loops:** All loops must be provably terminating. Hyperion uses pragmatic bounds (512 iterations) for DPI scanning.
+* **Stack Limits:** The BPF stack is constrained to 512 bytes. Complex parsing requires careful memory planning.
+* **Helper Function Restrictions:** Only a subset of kernel helpers are available in XDP context (no socket access, no sleepable operations).
 
-### 2. Wire-Speed Performance vs. Complexity
+### Performance vs. Expressiveness
 
-Inspecting payloads often introduces latency. Hyperion solves this by:
+* **Deep Packet Inspection:** String matching at wire speed requires creative algorithms. Hyperion implements a verifier-safe Boyer-Moore-like approach.
+* **Stateful Tracking:** LRU hash maps balance memory efficiency with high-cardinality flows.
+* **Zero-Copy Telemetry:** Ring buffers provide lock-free event streaming without per-packet memcpy overhead.
 
-- **Early Exit:** Dropping non-relevant traffic (e.g., non-TCP or specific ports) before the DPI engine is even invoked.
-- **Zero-Copy Telemetry:** Using BPF Ring Buffers (introduced in Kernel 5.8) instead of Perf Buffers, reducing CPU overhead and memory fragmentation under high load (~976K events/sec).
+### Integration Complexity
 
-### 3. Dynamic Policy Injection without Re-programming
-
-To avoid detaching the XDP program and losing packets during updates:
-
-- **BPF Maps:** Hyperion leverages BPF Maps to hot-reload signatures and blacklists. This allows `hyperion_ctrl` to update security policies in real-time without interrupting the packet processing pipeline.
-
-### 4. The "Two Towers" Contextual Gap
-
-A major challenge in systems security is that the Network Layer (XDP) doesn't know about Process IDs (PIDs).
-
-- **Current Solution:** Hyperion focuses on the "Transport Boundary," while Sentinel monitors the "Process Boundary."
-- **Future Work:** Exploring `task_struct` correlation via socket cookies to bridge this visibility gap.
+* **Hot Reload:** Updating BPF maps atomically while maintaining packet processing integrity.
+* **Multi-Interface Support:** Managing lifecycle across diverse NIC drivers and modes (native vs. generic XDP).
+* **Telemetry Backpressure:** Handling scenarios where user space can't consume events fast enough.
 
 ---
 
@@ -115,7 +108,7 @@ A major challenge in systems security is that the Network Layer (XDP) doesn't kn
 
 **Live Verification:** The system drops a payload containing the signature "root" and then dynamically reloads to block "admin" without restarting.
 
-[![asciicast](https://asciinema.org/a/ShlOWFRxuQABuwp4.svg)](https://asciinema.org/a/ShlOWFRxuQABuwp4)
+[![asciicast](https://asciinema.org/a/dTObeTBqpOoSbzyD.svg)](https://asciinema.org/a/dTObeTBqpOoSbzyD)
 
 ---
 
