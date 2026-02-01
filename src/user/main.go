@@ -311,8 +311,9 @@ func formatTelemetryEvent(event *HypEvent) string {
     dstIP := int2ip(event.DstIP)
     
     // Convert ports from network byte order (big endian) to host byte order
-    srcPort := binary.BigEndian.Uint16([]byte{byte(event.SrcPort >> 8), byte(event.SrcPort)})
-    dstPort := binary.BigEndian.Uint16([]byte{byte(event.DstPort >> 8), byte(event.DstPort)})
+    // Ports are stored in network byte order, so we just need to swap bytes
+    srcPort := (event.SrcPort >> 8) | (event.SrcPort << 8)
+    dstPort := (event.DstPort >> 8) | (event.DstPort << 8)
     
     // Determine protocol name
     protoName := "UNKNOWN"
