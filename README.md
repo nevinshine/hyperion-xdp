@@ -22,7 +22,7 @@ root@Hyperion-Edge:~# ./hyperion_ctrl --load --interface=eth0
   > ENGINE:         eBPF/XDP (Restricted C)
   > CONTROLLER:     Go (Cilium Library)
   > LICENSE:        GPLv2 (Kern) / MIT (User)
-  > TARGET:         MSc Cybersecurity Research Artifact
+  > TARGET:         Cybersecurity Research Artifact
 
 ```
 
@@ -80,15 +80,39 @@ We define success through distinct capability milestones.
 
 ---
 
-## [ 0x04 ] DEMO ARTIFACT
+## [ 0x04 ] RESEARCH & ENGINEERING CHALLENGES
 
-**Live Verification:** The system drops a payload containing the signature "root" and then dynamically reloads to block "admin" without restarting.
+### Kernel Verifier Constraints
 
-[![asciicast](https://asciinema.org/a/ShlOWFRxuQABuwp4.svg)](https://asciinema.org/a/ShlOWFRxuQABuwp4)
+The eBPF verifier enforces strict safety guarantees, creating unique engineering challenges:
+
+* **Bounded Loops:** All loops must be provably terminating. Hyperion uses pragmatic bounds (512 iterations) for DPI scanning.
+* **Stack Limits:** The BPF stack is constrained to 512 bytes. Complex parsing requires careful memory planning.
+* **Helper Function Restrictions:** Only a subset of kernel helpers are available in XDP context (no socket access, no sleepable operations).
+
+### Performance vs. Expressiveness
+
+* **Deep Packet Inspection:** String matching at wire speed requires creative algorithms. Hyperion implements a verifier-safe Boyer-Moore-like approach.
+* **Stateful Tracking:** LRU hash maps balance memory efficiency with high-cardinality flows.
+* **Zero-Copy Telemetry:** Ring buffers provide lock-free event streaming without per-packet memcpy overhead.
+
+### Integration Complexity
+
+* **Hot Reload:** Updating BPF maps atomically while maintaining packet processing integrity.
+* **Multi-Interface Support:** Managing lifecycle across diverse NIC drivers and modes (native vs. generic XDP).
+* **Telemetry Backpressure:** Handling scenarios where user space can't consume events fast enough.
 
 ---
 
-## [ 0x05 ] OPERATIONAL MANUAL
+## [ 0x05 ] DEMO ARTIFACT
+
+**Live Verification:** The system drops a payload containing the signature "root" and then dynamically reloads to block "admin" without restarting.
+
+[![asciicast](https://asciinema.org/a/dTObeTBqpOoSbzyD.svg)](https://asciinema.org/a/dTObeTBqpOoSbzyD)
+
+---
+
+## [ 0x06 ] OPERATIONAL MANUAL
 
 ### Prerequisites
 
@@ -139,7 +163,7 @@ See [docs/TELEMETRY.md](docs/TELEMETRY.md) for detailed information about:
 
 ---
 
-## [ 0x06 ] CITATION
+## [ 0x07 ] CITATION
 
 ```text
 @software{hyperion2026,
