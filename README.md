@@ -18,7 +18,7 @@ root@Hyperion-Edge:~# ./hyperion_ctrl --load --interface=eth0
   >> EBPF/XDP HIGH-PERFORMANCE PACKET FILTER <<
 
   [RUNTIME STATUS]
-  > MILESTONE:      M4.6 (Dynamic Policy + Ring Buffer)
+  > MILESTONE:      M5.0 (Telemetry + Flow Tracking)
   > ENGINE:         eBPF/XDP (Restricted C)
   > CONTROLLER:     Go (Cilium Library)
   > LICENSE:        GPLv2 (Kern) / MIT (User)
@@ -155,11 +155,12 @@ sudo pkill -HUP hyperion_ctrl
 
 ### Telemetry
 
-See [docs/TELEMETRY.md](docs/TELEMETRY.md) for detailed information about:
-- Event types and schema
-- 5-tuple flow tracking
-- CLI usage and options
-- API reference for telemetry consumers
+See [docs/TELEMETRY.md](https://www.google.com/search?q=docs/TELEMETRY.md) for detailed information about:
+
+* Event types and schema
+* 5-tuple flow tracking
+* CLI usage and options
+* API reference for telemetry consumers
 
 ---
 
