@@ -63,6 +63,7 @@ var loadedSigs []string
 func main() {
     // Default to 'wlp1s0' if not specified
     ifaceName := flag.String("iface", "wlp1s0", "Interface to attach XDP")
+    sigFlag := flag.String("sig", "", "Comma-separated signatures (e.g., -sig \"hack,malware,evil\")")
     flag.Parse()
 
     printBanner()
@@ -79,7 +80,7 @@ func main() {
     defer objs.Close()
 
     // 2. Load Config
-    if err := reloadSignatures(objs.PolicyMap); err != nil {
+    if err := reloadSignatures(objs.PolicyMap, *sigFlag); err != nil {
         log.Printf("%s[!] Initial load warning: %v%s", ColorYellow, err, ColorReset)
     }
 
@@ -153,7 +154,7 @@ func main() {
         switch sig {
         case syscall.SIGHUP:
             fmt.Printf("\n%s[!] Reloading signatures...%s\n", ColorYellow, ColorReset)
-            if err := reloadSignatures(objs.PolicyMap); err != nil {
+            if err := reloadSignatures(objs.PolicyMap, *sigFlag); err != nil {
                 fmt.Printf("%s[-] Reload Error: %v%s\n", ColorRed, err, ColorReset)
             } else {
                 fmt.Printf("%s[+] Reload Complete.%s\n", ColorGreen, ColorReset)
@@ -165,19 +166,32 @@ func main() {
     }
 }
 
-func reloadSignatures(m *ebpf.Map) error {
-    f, err := os.Open(ConfigFile)
-    if err != nil {
-        return err
-    }
-    defer f.Close()
-
+func reloadSignatures(m *ebpf.Map, cliSig string) error {
     var newSigs []string
-    sc := bufio.NewScanner(f)
-    for sc.Scan() {
-        line := strings.TrimSpace(sc.Text())
-        if line != "" && !strings.HasPrefix(line, "#") {
-            newSigs = append(newSigs, line)
+    
+    // If CLI flag is provided, use it; otherwise fall back to file
+    if cliSig != "" {
+        // Parse comma-separated signatures from CLI
+        for _, sig := range strings.Split(cliSig, ",") {
+            sig = strings.TrimSpace(sig)
+            if sig != "" {
+                newSigs = append(newSigs, sig)
+            }
+        }
+    } else {
+        // Fall back to file-based config
+        f, err := os.Open(ConfigFile)
+        if err != nil {
+            return err
+        }
+        defer f.Close()
+
+        sc := bufio.NewScanner(f)
+        for sc.Scan() {
+            line := strings.TrimSpace(sc.Text())
+            if line != "" && !strings.HasPrefix(line, "#") {
+                newSigs = append(newSigs, line)
+            }
         }
     }
 
