@@ -10,3 +10,5 @@ src/user/xdp_bpf.o
 
 # Config
 signatures.txt
+__pycache__/
+test_cli_flag.sh
