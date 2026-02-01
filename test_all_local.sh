@@ -17,6 +17,10 @@ TOTAL_TESTS=0
 PASSED_TESTS=0
 FAILED_TESTS=0
 
+# Create temporary directory for test logs
+TMPDIR=$(mktemp -d)
+trap "rm -rf $TMPDIR" EXIT
+
 print_header() {
     echo -e "${BLUE}╔═══════════════════════════════════════════════════════════════════╗${NC}"
     echo -e "${BLUE}║          HYPERION XDP M5 - LOCAL TESTING SUITE                  ║${NC}"
@@ -98,13 +102,13 @@ test_result $? "Clean build artifacts"
 
 echo ""
 echo "[2.2] Building project..."
-if make build &> /tmp/build.log; then
+if make build &> $TMPDIR/build.log; then
     test_result 0 "Project builds successfully"
     echo "      Binary size: $(ls -lh bin/hyperion_ctrl | awk '{print $5}')"
 else
     test_result 1 "Build failed"
-    echo "      See /tmp/build.log for details"
-    tail -20 /tmp/build.log
+    echo "      See $TMPDIR/build.log for details"
+    tail -20 $TMPDIR/build.log
 fi
 
 echo ""
@@ -131,23 +135,23 @@ print_section "SECTION 3: Unit Tests"
 
 echo "[3.1] Running Go unit tests..."
 cd src/user
-if go test -v &> /tmp/unittest.log; then
+if go test -v &> $TMPDIR/unittest.log; then
     test_result 0 "All unit tests pass"
-    grep "PASS:" /tmp/unittest.log | while read line; do
+    grep "PASS:" $TMPDIR/unittest.log | while read line; do
         echo "      $line"
     done
 else
     test_result 1 "Unit tests failed"
-    tail -20 /tmp/unittest.log
+    tail -20 $TMPDIR/unittest.log
 fi
 cd ../..
 
 echo ""
 echo "[3.2] Running benchmarks..."
 cd src/user
-if go test -bench=. -benchmem &> /tmp/bench.log; then
+if go test -bench=. -benchmem &> $TMPDIR/bench.log; then
     test_result 0 "Benchmarks completed"
-    grep "Benchmark" /tmp/bench.log | while read line; do
+    grep "Benchmark" $TMPDIR/bench.log | while read line; do
         echo "      $line"
     done
 else
@@ -161,7 +165,7 @@ cd ../..
 print_section "SECTION 4: Struct Alignment Validation"
 
 echo "[4.1] Testing Go struct size..."
-cat > /tmp/test_go_struct.go << 'EOF'
+cat > $TMPDIR/test_go_struct.go << 'EOF'
 package main
 import (
     "encoding/binary"
@@ -184,7 +188,7 @@ func main() {
     fmt.Println(binary.Size(e))
 }
 EOF
-GO_SIZE=$(go run /tmp/test_go_struct.go)
+GO_SIZE=$(go run $TMPDIR/test_go_struct.go)
 echo "      Go struct size: $GO_SIZE bytes"
 if [ "$GO_SIZE" = "40" ]; then
     test_result 0 "Go struct size correct (40 bytes)"
@@ -194,7 +198,7 @@ fi
 
 echo ""
 echo "[4.2] Testing C struct size..."
-cat > /tmp/test_c_struct.c << 'EOF'
+cat > $TMPDIR/test_c_struct.c << 'EOF'
 #include <stdio.h>
 #include <stdint.h>
 struct hyp_event {
@@ -214,8 +218,8 @@ int main() {
     return 0;
 }
 EOF
-gcc /tmp/test_c_struct.c -o /tmp/test_c_struct 2>/dev/null
-C_SIZE=$(/tmp/test_c_struct)
+gcc $TMPDIR/test_c_struct.c -o $TMPDIR/test_c_struct 2>/dev/null
+C_SIZE=$($TMPDIR/test_c_struct)
 echo "      C struct size: $C_SIZE bytes"
 if [ "$C_SIZE" = "40" ]; then
     test_result 0 "C struct size correct (40 bytes)"
@@ -277,11 +281,10 @@ else
 
     echo ""
     echo "[6.3] Testing file logging..."
-    LOGFILE="/tmp/hyperion_test_$$.log"
+    LOGFILE="$TMPDIR/hyperion_test.log"
     timeout 2 ./bin/hyperion_ctrl -iface lo -telemetry -logfile "$LOGFILE" 2>&1 > /dev/null
     if [ -f "$LOGFILE" ]; then
         test_result 0 "Log file created"
-        rm -f "$LOGFILE"
     else
         test_result 1 "Log file not created"
     fi
@@ -329,11 +332,11 @@ print_section "SECTION 8: Integration Test Suite"
 
 echo "[8.1] Running integration test script..."
 if [ -f "test_integration.sh" ] && [ -x "test_integration.sh" ]; then
-    if ./test_integration.sh &> /tmp/integration.log; then
+    if ./test_integration.sh &> $TMPDIR/integration.log; then
         test_result 0 "Integration tests pass"
     else
         test_result 1 "Integration tests failed"
-        tail -20 /tmp/integration.log
+        tail -20 $TMPDIR/integration.log
     fi
 else
     test_result 1 "Integration test script missing or not executable"

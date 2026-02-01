@@ -142,94 +142,96 @@ int hyperion_filter(struct xdp_md *ctx) {
         bpf_map_update_elem(&flow_map, &fkey, &new_fval, BPF_ANY);
     }
     
-    // 4. Payload
+    // 4. Payload check for signature matching
     void *payload_start = c.pos;
-    // VERIFIER FIX: Explicit pointer check instead of math
-    if (payload_start >= c.end) return XDP_PASS;
-
     __u8 *data = (__u8 *)payload_start;
+    int has_payload = (payload_start < c.end);
+    
+    // Only check for signature matches if we have payload data
+    if (has_payload) {
+        // RULE LOOP
+        #pragma unroll
+        for (__u32 i = 0; i < MAX_RULES; i++) {
+            __u32 key = i;
+            struct policy_t *pol = bpf_map_lookup_elem(&policy_map, &key);
+            
+            if (!pol || pol->active == 0) continue;
+            
+            // VERIFIER FIX: Check bounds explicitly before reading signature
+            // We need at least 4 bytes to check the first block
+            if ((void*)(data + 4) > c.end) break; 
 
-    // RULE LOOP
-    #pragma unroll
-    for (__u32 i = 0; i < MAX_RULES; i++) {
-        __u32 key = i;
-        struct policy_t *pol = bpf_map_lookup_elem(&policy_map, &key);
-        
-        if (!pol || pol->active == 0) continue;
-        
-        // VERIFIER FIX: Check bounds explicitly before reading signature
-        // We need at least 4 bytes to check the first block
-        if ((void*)(data + 4) > c.end) break; 
-
-        // Now the verifier KNOWS data[0]..data[3] are safe
-        if (data[0] == pol->signature[0] &&
-            data[1] == pol->signature[1] &&
-            data[2] == pol->signature[2] &&
-            data[3] == pol->signature[3]) {
-            
-            // M5: Emit SIG_MATCH telemetry event
-            struct hyp_event *evt = bpf_ringbuf_reserve(&telemetry_ringbuf, sizeof(*evt), 0);
-            if (evt) {
-                evt->event_type = 2; // SIG_MATCH
-                evt->src_ip = ip->saddr;
-                evt->dst_ip = ip->daddr;
-                evt->src_port = tcp->source;
-                evt->dst_port = tcp->dest;
-                evt->protocol = ip->protocol;
-                evt->timestamp = now;
+            // Now the verifier KNOWS data[0]..data[3] are safe
+            if (data[0] == pol->signature[0] &&
+                data[1] == pol->signature[1] &&
+                data[2] == pol->signature[2] &&
+                data[3] == pol->signature[3]) {
                 
-                // Copy matched signature
-                #pragma unroll
-                for (int k = 0; k < 8; k++) {
-                    evt->signature[k] = pol->signature[k];
+                // M5: Emit SIG_MATCH telemetry event
+                struct hyp_event *evt = bpf_ringbuf_reserve(&telemetry_ringbuf, sizeof(*evt), 0);
+                if (evt) {
+                    evt->event_type = 2; // SIG_MATCH
+                    evt->src_ip = ip->saddr;
+                    evt->dst_ip = ip->daddr;
+                    evt->src_port = tcp->source;
+                    evt->dst_port = tcp->dest;
+                    evt->protocol = ip->protocol;
+                    evt->timestamp = now;
+                    
+                    // Copy matched signature
+                    #pragma unroll
+                    for (int k = 0; k < 8; k++) {
+                        evt->signature[k] = pol->signature[k];
+                    }
+                    bpf_ringbuf_submit(evt, 0);
                 }
-                bpf_ringbuf_submit(evt, 0);
-            }
-            
-            // Found a match! Trigger Alert (legacy)
-            struct event_t *e = bpf_ringbuf_reserve(&alert_ringbuf, sizeof(*e), 0);
-            if (e) {
-                e->src_ip = ip->saddr;
-                e->dst_ip = ip->daddr;
-                e->src_port = tcp->source;
-                e->dst_port = tcp->dest;
-                e->action = 1; // DROP
                 
-                // Safe Copy for Alert Log
-                #pragma unroll
-                for (int k = 0; k < 8; k++) {
-                    if ((void*)(data + k + 1) <= c.end)
-                        e->payload_snippet[k] = data[k];
-                    else
-                        e->payload_snippet[k] = 0;
+                // Found a match! Trigger Alert (legacy)
+                struct event_t *e = bpf_ringbuf_reserve(&alert_ringbuf, sizeof(*e), 0);
+                if (e) {
+                    e->src_ip = ip->saddr;
+                    e->dst_ip = ip->daddr;
+                    e->src_port = tcp->source;
+                    e->dst_port = tcp->dest;
+                    e->action = 1; // DROP
+                    
+                    // Safe Copy for Alert Log
+                    #pragma unroll
+                    for (int k = 0; k < 8; k++) {
+                        if ((void*)(data + k + 1) <= c.end)
+                            e->payload_snippet[k] = data[k];
+                        else
+                            e->payload_snippet[k] = 0;
+                    }
+                    bpf_ringbuf_submit(e, 0);
                 }
-                bpf_ringbuf_submit(e, 0);
-            }
-            
-            // M5: Emit DROP telemetry event
-            evt = bpf_ringbuf_reserve(&telemetry_ringbuf, sizeof(*evt), 0);
-            if (evt) {
-                evt->event_type = 1; // DROP
-                evt->src_ip = ip->saddr;
-                evt->dst_ip = ip->daddr;
-                evt->src_port = tcp->source;
-                evt->dst_port = tcp->dest;
-                evt->protocol = ip->protocol;
-                evt->timestamp = now;
                 
-                // Copy matched signature for context
-                #pragma unroll
-                for (int k = 0; k < 8; k++) {
-                    evt->signature[k] = pol->signature[k];
+                // M5: Emit DROP telemetry event
+                evt = bpf_ringbuf_reserve(&telemetry_ringbuf, sizeof(*evt), 0);
+                if (evt) {
+                    evt->event_type = 1; // DROP
+                    evt->src_ip = ip->saddr;
+                    evt->dst_ip = ip->daddr;
+                    evt->src_port = tcp->source;
+                    evt->dst_port = tcp->dest;
+                    evt->protocol = ip->protocol;
+                    evt->timestamp = now;
+                    
+                    // Copy matched signature for context
+                    #pragma unroll
+                    for (int k = 0; k < 8; k++) {
+                        evt->signature[k] = pol->signature[k];
+                    }
+                    bpf_ringbuf_submit(evt, 0);
                 }
-                bpf_ringbuf_submit(evt, 0);
+                
+                return XDP_DROP;
             }
-            
-            return XDP_DROP;
         }
     }
 
     // M5: Emit ACCEPT telemetry event for packets that pass
+    // This happens regardless of whether the packet has payload
     struct hyp_event *evt = bpf_ringbuf_reserve(&telemetry_ringbuf, sizeof(*evt), 0);
     if (evt) {
         evt->event_type = 0; // ACCEPT

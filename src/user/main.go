@@ -71,6 +71,7 @@ type AlertEvent struct {
 }
 
 var loadedSigs []string
+var bootTimeOffset int64 // Boot time offset to convert bpf_ktime_get_ns() to Unix time
 
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc $BPF_CLANG -cflags $BPF_CFLAGS bpf ../kern/hyperion_core.c -- -I../common
 
@@ -83,6 +84,12 @@ func main() {
     flag.Parse()
 
     printBanner()
+
+    // 0. Calculate boot time offset for timestamp conversion
+    // bpf_ktime_get_ns() returns nanoseconds since boot, not Unix epoch
+    if err := calculateBootTimeOffset(); err != nil {
+        log.Fatalf("%s[!] Failed to calculate boot time offset: %v%s", ColorRed, err, ColorReset)
+    }
 
     // 1. Init
     if err := rlimit.RemoveMemlock(); err != nil {
@@ -300,10 +307,36 @@ func int2ip(nn uint32) net.IP {
     return ip
 }
 
+// Calculate boot time offset to convert bpf_ktime_get_ns() to Unix time
+func calculateBootTimeOffset() error {
+    // Read system uptime from /proc/uptime
+    data, err := os.ReadFile("/proc/uptime")
+    if err != nil {
+        return fmt.Errorf("failed to read /proc/uptime: %w", err)
+    }
+    
+    // /proc/uptime contains two numbers: uptime in seconds and idle time
+    // We only need the first number
+    var uptimeSeconds float64
+    _, err = fmt.Sscanf(string(data), "%f", &uptimeSeconds)
+    if err != nil {
+        return fmt.Errorf("failed to parse /proc/uptime: %w", err)
+    }
+    
+    // Convert uptime to nanoseconds
+    bootTimeNs := int64(uptimeSeconds * 1e9)
+    
+    // Calculate offset: current Unix time - boot time
+    bootTimeOffset = time.Now().UnixNano() - bootTimeNs
+    
+    return nil
+}
+
 // M5: Format telemetry event for display
 func formatTelemetryEvent(event *HypEvent) string {
-    // Convert timestamp from nanoseconds to time
-    t := time.Unix(0, int64(event.Timestamp))
+    // Convert timestamp from boot time nanoseconds to Unix time
+    // bpf_ktime_get_ns() returns nanoseconds since boot, so we add our offset
+    t := time.Unix(0, int64(event.Timestamp)+bootTimeOffset)
     timestamp := t.Format("2006-01-02 15:04:05")
     
     // Convert IPs
