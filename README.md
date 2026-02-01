@@ -22,7 +22,7 @@ root@Hyperion-Edge:~# ./hyperion_ctrl --load --interface=eth0
   > ENGINE:         eBPF/XDP (Restricted C)
   > CONTROLLER:     Go (Cilium Library)
   > LICENSE:        GPLv2 (Kern) / MIT (User)
-  > TARGET:         MSc Cybersecurity Research Artifact
+  > TARGET:         Cybersecurity Research Artifact
 
 ```
 
@@ -80,7 +80,38 @@ We define success through distinct capability milestones.
 
 ---
 
-## [ 0x04 ] DEMO ARTIFACT
+## [ 0x04 ] RESEARCH & ENGINEERING CHALLENGES
+
+### 1. Verifier-Safe Deep Packet Inspection (DPI)
+
+The BPF Verifier enforces a strict instruction limit and forbids indeterminate loops. Implementing payload matching for signatures like "root" required:
+
+- **Loop Unrolling:** Utilizing `#pragma unroll` to satisfy the verifier's requirement for bounded execution.
+- **Pointer Arithmetic Validation:** Implementing rigorous bounds checking against `data_end` to prevent out-of-bounds memory access during L7 inspection.
+
+### 2. Wire-Speed Performance vs. Complexity
+
+Inspecting payloads often introduces latency. Hyperion solves this by:
+
+- **Early Exit:** Dropping non-relevant traffic (e.g., non-TCP or specific ports) before the DPI engine is even invoked.
+- **Zero-Copy Telemetry:** Using BPF Ring Buffers (introduced in Kernel 5.8) instead of Perf Buffers, reducing CPU overhead and memory fragmentation under high load (~976K events/sec).
+
+### 3. Dynamic Policy Injection without Re-programming
+
+To avoid detaching the XDP program and losing packets during updates:
+
+- **BPF Maps:** Hyperion leverages BPF Maps to hot-reload signatures and blacklists. This allows `hyperion_ctrl` to update security policies in real-time without interrupting the packet processing pipeline.
+
+### 4. The "Two Towers" Contextual Gap
+
+A major challenge in systems security is that the Network Layer (XDP) doesn't know about Process IDs (PIDs).
+
+- **Current Solution:** Hyperion focuses on the "Transport Boundary," while Sentinel monitors the "Process Boundary."
+- **Future Work:** Exploring `task_struct` correlation via socket cookies to bridge this visibility gap.
+
+---
+
+## [ 0x05 ] DEMO ARTIFACT
 
 **Live Verification:** The system drops a payload containing the signature "root" and then dynamically reloads to block "admin" without restarting.
 
@@ -88,7 +119,7 @@ We define success through distinct capability milestones.
 
 ---
 
-## [ 0x05 ] OPERATIONAL MANUAL
+## [ 0x06 ] OPERATIONAL MANUAL
 
 ### Prerequisites
 
@@ -139,7 +170,7 @@ See [docs/TELEMETRY.md](docs/TELEMETRY.md) for detailed information about:
 
 ---
 
-## [ 0x06 ] CITATION
+## [ 0x07 ] CITATION
 
 ```text
 @software{hyperion2026,
