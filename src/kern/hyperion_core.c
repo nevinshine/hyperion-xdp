@@ -12,7 +12,7 @@ struct policy_t {
     __u8 signature[8];
     __u8 sig_len;
     __u8 active;
-    __u8 _pad[2]; 
+    __u8 _pad[2];
 };
 
 // M5: New telemetry event structure
@@ -51,7 +51,7 @@ struct event_t {
     __u32 dst_ip;
     __u16 src_port;
     __u16 dst_port;
-    __u32 action; 
+    __u32 action;
     __u8 payload_snippet[8];
 };
 
@@ -64,7 +64,7 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 1 << 14); 
+    __uint(max_entries, 1 << 14);
 } alert_ringbuf SEC(".maps");
 
 // M5: Ring buffer for telemetry events
@@ -100,9 +100,9 @@ int hyperion_filter(struct xdp_md *ctx) {
     // 2. IP
     struct iphdr *ip = c.pos;
     if ((void *)(ip + 1) > c.end) return XDP_PASS;
-    
+
     // VERIFIER FIX: Sanity check IP header length
-    if (ip->ihl < 5) return XDP_PASS; 
+    if (ip->ihl < 5) return XDP_PASS;
     c.pos += ip->ihl * 4;
 
     if (ip->protocol != IPPROTO_TCP) return XDP_PASS;
@@ -111,7 +111,7 @@ int hyperion_filter(struct xdp_md *ctx) {
     struct tcphdr *tcp = c.pos;
     if ((void *)(tcp + 1) > c.end) return XDP_PASS;
     c.pos += tcp->doff * 4;
-    
+
     // M5: Update flow tracking
     struct flow_key fkey = {};
     fkey.src_ip = ip->saddr;
@@ -119,13 +119,13 @@ int hyperion_filter(struct xdp_md *ctx) {
     fkey.src_port = tcp->source;
     fkey.dst_port = tcp->dest;
     fkey.protocol = ip->protocol;
-    
+
     __u64 now = bpf_ktime_get_ns();
     // Calculate packet length from data pointers
     void *data_start = (void *)(long)ctx->data;
     void *data_end = (void *)(long)ctx->data_end;
     __u32 pkt_len = data_end - data_start;
-    
+
     struct flow_value *fval = bpf_map_lookup_elem(&flow_map, &fkey);
     if (fval) {
         // Update existing flow
@@ -141,12 +141,12 @@ int hyperion_filter(struct xdp_md *ctx) {
         new_fval.last_seen = now;
         bpf_map_update_elem(&flow_map, &fkey, &new_fval, BPF_ANY);
     }
-    
+
     // 4. Payload check for signature matching
     void *payload_start = c.pos;
     __u8 *data = (__u8 *)payload_start;
     int has_payload = (payload_start < c.end);
-    
+
     // Only check for signature matches if we have payload data
     if (has_payload) {
         // RULE LOOP
@@ -154,19 +154,19 @@ int hyperion_filter(struct xdp_md *ctx) {
         for (__u32 i = 0; i < MAX_RULES; i++) {
             __u32 key = i;
             struct policy_t *pol = bpf_map_lookup_elem(&policy_map, &key);
-            
+
             if (!pol || pol->active == 0) continue;
-            
+
             // VERIFIER FIX: Check bounds explicitly before reading signature
             // We need at least 4 bytes to check the first block
-            if ((void*)(data + 4) > c.end) break; 
+            if ((void*)(data + 4) > c.end) break;
 
             // Now the verifier KNOWS data[0]..data[3] are safe
             if (data[0] == pol->signature[0] &&
                 data[1] == pol->signature[1] &&
                 data[2] == pol->signature[2] &&
                 data[3] == pol->signature[3]) {
-                
+
                 // M5: Emit SIG_MATCH telemetry event
                 struct hyp_event *evt = bpf_ringbuf_reserve(&telemetry_ringbuf, sizeof(*evt), 0);
                 if (evt) {
@@ -177,7 +177,7 @@ int hyperion_filter(struct xdp_md *ctx) {
                     evt->dst_port = tcp->dest;
                     evt->protocol = ip->protocol;
                     evt->timestamp = now;
-                    
+
                     // Copy matched signature
                     #pragma unroll
                     for (int k = 0; k < 8; k++) {
@@ -185,7 +185,7 @@ int hyperion_filter(struct xdp_md *ctx) {
                     }
                     bpf_ringbuf_submit(evt, 0);
                 }
-                
+
                 // Found a match! Trigger Alert (legacy)
                 struct event_t *e = bpf_ringbuf_reserve(&alert_ringbuf, sizeof(*e), 0);
                 if (e) {
@@ -194,7 +194,7 @@ int hyperion_filter(struct xdp_md *ctx) {
                     e->src_port = tcp->source;
                     e->dst_port = tcp->dest;
                     e->action = 1; // DROP
-                    
+
                     // Safe Copy for Alert Log
                     #pragma unroll
                     for (int k = 0; k < 8; k++) {
@@ -205,7 +205,7 @@ int hyperion_filter(struct xdp_md *ctx) {
                     }
                     bpf_ringbuf_submit(e, 0);
                 }
-                
+
                 // M5: Emit DROP telemetry event
                 evt = bpf_ringbuf_reserve(&telemetry_ringbuf, sizeof(*evt), 0);
                 if (evt) {
@@ -216,7 +216,7 @@ int hyperion_filter(struct xdp_md *ctx) {
                     evt->dst_port = tcp->dest;
                     evt->protocol = ip->protocol;
                     evt->timestamp = now;
-                    
+
                     // Copy matched signature for context
                     #pragma unroll
                     for (int k = 0; k < 8; k++) {
@@ -224,7 +224,7 @@ int hyperion_filter(struct xdp_md *ctx) {
                     }
                     bpf_ringbuf_submit(evt, 0);
                 }
-                
+
                 return XDP_DROP;
             }
         }
@@ -241,7 +241,7 @@ int hyperion_filter(struct xdp_md *ctx) {
         evt->dst_port = tcp->dest;
         evt->protocol = ip->protocol;
         evt->timestamp = now;
-        
+
         // No signature for ACCEPT events
         #pragma unroll
         for (int k = 0; k < 8; k++) {
