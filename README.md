@@ -112,6 +112,14 @@ The eBPF verifier enforces strict safety guarantees, creating unique engineering
 
 ---
 
+## [ 0x05.1 ] BENCHMARK RESULTS
+
+**See the latest local performance benchmarks:**
+
+👉 [benchmarks/BENCHMARKS.md](benchmarks/BENCHMARKS.md)
+
+---
+
 ## [ 0x06 ] OPERATIONAL MANUAL
 
 ### Prerequisites

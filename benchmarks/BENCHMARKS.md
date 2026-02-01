@@ -408,5 +408,58 @@ To add new benchmarks:
 
 ---
 
+## Local Benchmark Results (2026-02-01)
+
+**Test System:** Fedora, loopback interface (lo)
+
+### CPU Utilization Results
+
+| Configuration    | Avg User CPU | Avg System CPU | Avg Idle |
+|------------------|--------------|----------------|----------|
+| Baseline         | 1.49%        | 30.65%         | 56.01%   |
+| Header Filter    | 1.81%        | 21.65%         | 58.50%   |
+| Full DPI         | 1.25%        | 22.07%         | 58.84%   |
+
+**Notes:**
+- No XDP programs were detected as attached during the test. Ensure Hyperion is running and XDP is properly attached for accurate results.
+- Detailed logs are available in `/tmp/hyperion_cpu/*.log`.
+
+---
+
+### Throughput Results
+
+| Configuration    | Bits/sec (Gbps) | Bytes Sent    | Retransmits |
+|------------------|-----------------|--------------|-------------|
+| Baseline         | 64.32           | 80,408,079,408| 674         |
+| Header Filter    | 63.42           | 79,284,797,440| 534         |
+| Full DPI         | 65.28           | 81,605,165,056| 481         |
+
+**Notes:**
+- Results are from iperf3, 10s per test, loopback interface.
+- Values are from the `sum_sent.bits_per_second` field, divided by 1e9 for Gbps.
+- Retransmits are from the `sum_sent.retransmits` field.
+
+---
+
+### Latency Results
+
+| Metric   | Baseline | Header Filter | Full DPI |
+|----------|----------|--------------|----------|
+| MIN      | 0.022 ms | 0.012 ms     | 0.020 ms |
+| MAX      | 0.178 ms | 0.177 ms     | 0.143 ms |
+| MEAN     | 0.099 ms | 0.100 ms     | 0.100 ms |
+| MEDIAN   | 0.102 ms | 0.104 ms     | 0.102 ms |
+| STDEV    | 0.021 ms | 0.021 ms     | 0.020 ms |
+| P50      | 0.102 ms | 0.104 ms     | 0.102 ms |
+| P95      | 0.128 ms | 0.128 ms     | 0.129 ms |
+| P99      | 0.178 ms | 0.177 ms     | 0.143 ms |
+
+**Notes:**
+- 100 ICMP packets per test, loopback interface.
+- Histogram and percentile charts saved to `/tmp/hyperion_latency_histogram.png` and `/tmp/hyperion_latency_percentiles.png`.
+- Raw data saved to `/tmp/hyperion_latency_data.json`.
+
+---
+
 **Last Updated**: 2026-02-01  
 **Maintainer**: Nevin (@nevinshine)
