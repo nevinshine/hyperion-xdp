@@ -52,7 +52,7 @@ Hyperion complements Sentinel by securing the transport boundary.
 | --- | --- | --- |
 | **Boundary** | Process Execution | Network Transport |
 | **Mechanism** | `ptrace` / Kernel Modules | `eBPF` / `XDP` |
-| **Visibility** | Syscalls (`execve`, `open`) | Payloads (`GET /hack`) |
+| **Visibility** | Syscalls (`execve`, `open`) | Payloads (`GET /hack`) | 
 | **Constraint** | Context-Aware Logic | Sub-microsecond Latency |
 
 ### Component Logic
