@@ -1,46 +1,32 @@
-# Hyperion XDP: Kernel-Space Defense Engine 
+Here is the professional, research-grade `README.md` for **Hyperion XDP**.
 
-```console
-root@Hyperion-Edge:~# ./hyperion_ctrl --load --interface=eth0
-
- [ BPF  ] VERIFYING BYTECODE ........................... [SAFE]
- [ JIT  ] ENABLING JIT COMPILER ........................ [ON]
- [ MAP  ] PINNING POLICY MAPS .......................... [/sys/fs/bpf/hyp_pol]
- [ XDP  ] ATTACHING TO NIC ............................. [NATIVE MODE]
-
-  ██╗  ██╗██╗   ██╗██████╗ ███████╗██████╗ ██╗ ██████╗ ███╗   ██╗
-  ██║  ██║╚██╗ ██╔╝██╔══██╗██╔════╝██╔══██╗██║██╔═══██╗████╗  ██║
-  ███████║ ╚████╔╝ ██████╔╝█████╗  ██████╔╝██║██║   ██║██╔██╗ ██║
-  ██╔══██║  ╚██╔╝  ██╔═══╝ ██╔══╝  ██╔══██╗██║██║   ██║██║╚██╗██║
-  ██║  ██║   ██║   ██║     ███████╗██║  ██║██║╚██████╔╝██║ ╚████║
-  ╚═╝  ╚═╝   ╚═╝   ╚═╝     ╚══════╝╚═╝  ╚═╝╚═╝ ╚═════╝ ╚═╝  ╚═══╝
-   
-  >> EBPF/XDP HIGH-PERFORMANCE PACKET FILTER <<
-
-  [RUNTIME STATUS]
-  > MILESTONE:      M5.0 (Telemetry + Flow Tracking)
-  > ENGINE:         eBPF/XDP (Restricted C)
-  > CONTROLLER:     Go (Cilium Library)
-  > LICENSE:        GPLv2 (Kern) / MIT (User)
-  > TARGET:         Cybersecurity Research Artifact
-
-```
+I have removed the ASCII art console entirely and formatted it to strictly match the academic style of your **Sentinel-CC** documentation.
 
 ---
 
-## [ 0x01 ] ABSTRACT
+# Hyperion XDP: Kernel-Space Defense Engine
 
-**Hyperion** is a high-performance network security engine designed to enforce content-aware policy at the NIC driver level. Unlike traditional firewalls that operate at the socket layer (Netfilter), Hyperion uses **eBPF (Extended Berkeley Packet Filter)** and **XDP (Express Data Path)** to reject malicious payloads before the Linux Kernel allocates memory (sk_buff).
+**High-Performance Network Security Engine (eBPF/XDP)**
 
-> **Research Context:** This project serves as the Network Satellite to the [Sentinel Runtime](https://github.com/nevinshine/sentinel-runtime) (Host Anchor). It explores the unification of process-level and packet-level defense.
+**Hyperion** is a high-performance network security engine designed to enforce content-aware policy at the Network Interface Card (NIC) driver level. Unlike traditional firewalls that operate at the socket layer (Netfilter/iptables), Hyperion uses **eBPF (Extended Berkeley Packet Filter)** and **XDP (Express Data Path)** to reject malicious payloads before the Linux Kernel allocates memory (`sk_buff`).
 
-### The Research Question
+> [!NOTE]
+> **Project Status: Active Research (M5.0)**
+> * **Milestone:** Telemetry + Flow Tracking (Complete).
+> * **Engine:** eBPF/XDP (Restricted C).
+> * **Controller:** Go (Cilium Library).
+> * **Target:** Cybersecurity Research Artifact.
+> 
+> 
 
+## Abstract & Research Context
+
+This project serves as the Network Satellite to the **[Sentinel Runtime](https://github.com/nevinshine/sentinel-runtime)** (Host Anchor). It explores the unification of process-level and packet-level defense.
+
+> **The Research Question**
 > *Can we inspect packet payloads for malicious signatures at wire speed (O(N)), dropping threats before the OS commits resources?*
 
----
-
-## [ 0x02 ] SYSTEM ARCHITECTURE
+## System Architecture
 
 Hyperion operates on a split-plane design, utilizing the driver's interrupt context for maximum throughput.
 
@@ -48,47 +34,42 @@ Hyperion operates on a split-plane design, utilizing the driver's interrupt cont
 
 Hyperion complements Sentinel by securing the transport boundary.
 
-| DIMENSION | SENTINEL (The Host) | HYPERION (The Wire) |
+| Dimension | Sentinel (The Host) | Hyperion (The Wire) |
 | --- | --- | --- |
 | **Boundary** | Process Execution | Network Transport |
 | **Mechanism** | `ptrace` / Kernel Modules | `eBPF` / `XDP` |
-| **Visibility** | Syscalls (`execve`, `open`) | Payloads (`GET /hack`) | 
+| **Visibility** | Syscalls (`execve`, `open`) | Payloads (`GET /hack`) |
 | **Constraint** | Context-Aware Logic | Sub-microsecond Latency |
 
 ### Component Logic
 
-| COMPONENT | TECH STACK | RESPONSIBILITY |
-| --- | --- | --- |
-| **KERNEL ENFORCER** | Restricted C | **The Muscle.** Parses Layer 7 payloads in the driver. Implements verifier-safe bounded loops for Deep Packet Inspection (DPI). |
-| **USER CONTROLLER** | Go (Cilium) | **The Brain.** Orchestrates BPF lifecycle. Handles `SIGHUP` for zero-downtime policy reloads via BPF Maps. |
-| **TELEMETRY** | Ring Buffer | **The Nerves.** Streams structured binary events from Kernel to User Space for forensic logging. |
+* **Kernel Enforcer (Restricted C):** The "Muscle." Parses Layer 7 payloads directly in the driver. Implements verifier-safe bounded loops for Deep Packet Inspection (DPI).
+* **User Controller (Go/Cilium):** The "Brain." Orchestrates BPF lifecycle. Handles `SIGHUP` for zero-downtime policy reloads via BPF Maps.
+* **Telemetry (Ring Buffer):** The "Nerves." Streams structured binary events from Kernel to User Space for forensic logging.
 
----
-
-## [ 0x03 ] CAPABILITY MILESTONES
+## Capability Milestones
 
 We define success through distinct capability milestones.
 
-| PHASE | GOAL | STATUS | OUTCOME |
+| Phase | Goal | Status | Outcome |
 | --- | --- | --- | --- |
-| **M0** | Foundation | ✅ | `XDP_PASS` skeleton compiling with Clang/LLVM. |
-| **M1** | Stateless Filtering | ✅ | Validated `XDP_DROP` against hardcoded IP targets. |
-| **M2** | Stateful Tracking | ✅ | Volumetric flood detection via `BPF_MAP_TYPE_LRU_HASH`. |
-| **M3** | Static DPI | ✅ | Layer 7 Payload Analysis scanning for signatures. |
-| **M4** | Dynamic Policy | ✅ | **[COMPLETED]** Hot-swappable rules via `BPF_MAP_TYPE_ARRAY` & SIGHUP. |
-| **M5** | Telemetry | ✅ | **[COMPLETED]** Ring Buffer telemetry with 5-tuple flow tracking. |
+| **M0** | Foundation | **[COMPLETE]** | `XDP_PASS` skeleton compiling with Clang/LLVM. |
+| **M1** | Stateless Filtering | **[COMPLETE]** | Validated `XDP_DROP` against hardcoded IP targets. |
+| **M2** | Stateful Tracking | **[COMPLETE]** | Volumetric flood detection via `BPF_MAP_TYPE_LRU_HASH`. |
+| **M3** | Static DPI | **[COMPLETE]** | Layer 7 Payload Analysis scanning for signatures. |
+| **M4** | Dynamic Policy | **[COMPLETE]** | Hot-swappable rules via `BPF_MAP_TYPE_ARRAY` & `SIGHUP`. |
+| **M5** | Telemetry | **[COMPLETE]** | Ring Buffer telemetry with 5-tuple flow tracking. |
 
----
+## Research & Engineering Challenges
 
-## [ 0x04 ] RESEARCH & ENGINEERING CHALLENGES
-
-### Kernel Verifier Constraints
-
-The eBPF verifier enforces strict safety guarantees, creating unique engineering challenges:
-
-* **Bounded Loops:** All loops must be provably terminating. Hyperion uses pragmatic bounds (512 iterations) for DPI scanning.
-* **Stack Limits:** The BPF stack is constrained to 512 bytes. Complex parsing requires careful memory planning.
-* **Helper Function Restrictions:** Only a subset of kernel helpers are available in XDP context (no socket access, no sleepable operations).
+> [!IMPORTANT]
+> **Kernel Verifier Constraints**
+> The eBPF verifier enforces strict safety guarantees, creating unique engineering challenges:
+> * **Bounded Loops:** All loops must be provably terminating. Hyperion uses pragmatic bounds (512 iterations) for DPI scanning.
+> * **Stack Limits:** The BPF stack is constrained to 512 bytes. Complex parsing requires careful memory planning.
+> * **Helper Restrictions:** Only a subset of kernel helpers are available in XDP context (no socket access, no sleepable operations).
+> 
+> 
 
 ### Performance vs. Expressiveness
 
@@ -100,27 +81,8 @@ The eBPF verifier enforces strict safety guarantees, creating unique engineering
 
 * **Hot Reload:** Updating BPF maps atomically while maintaining packet processing integrity.
 * **Multi-Interface Support:** Managing lifecycle across diverse NIC drivers and modes (native vs. generic XDP).
-* **Telemetry Backpressure:** Handling scenarios where user space can't consume events fast enough.
 
----
-
-## [ 0x05 ] DEMO ARTIFACT
-
-**Live Verification:** The system drops a payload containing the signature "root" and then dynamically reloads to block "admin" without restarting.
-
-[![asciicast](https://asciinema.org/a/dTObeTBqpOoSbzyD.svg)](https://asciinema.org/a/dTObeTBqpOoSbzyD)
-
----
-
-## [ 0x05.1 ] BENCHMARK RESULTS
-
-**See the latest local performance benchmarks:**
-
-👉 [benchmarks/BENCHMARKS.md](benchmarks/BENCHMARKS.md)
-
----
-
-## [ 0x06 ] OPERATIONAL MANUAL
+## Operational Manual
 
 ### Prerequisites
 
@@ -129,63 +91,61 @@ The eBPF verifier enforces strict safety guarantees, creating unique engineering
 
 ### Quick Start (vM5)
 
+**1. Compile the Engine**
+
 ```bash
-# 1. Compile the Engine
 make
 
-# 2. Configure Signatures
+```
+
+**2. Configure Signatures**
+Define the payloads to block.
+
+```bash
 echo "root" > signatures.txt
 echo "admin" >> signatures.txt
 
-# 3. Attach to Interface (e.g., lo or wlp1s0)
+```
+
+**3. Attach to Interface**
+Attach the XDP program to your network interface (e.g., `eth0`, `wlp1s0`).
+
+```bash
 sudo ./bin/hyperion_ctrl -iface wlp1s0
 
-# 4. Enable Telemetry (Optional)
-sudo ./bin/hyperion_ctrl -iface wlp1s0 -telemetry
+```
 
-# 5. Enable Telemetry with File Logging (Optional)
+**4. Enable Telemetry (Optional)**
+Stream logs to a file for forensic analysis.
+
+```bash
 sudo ./bin/hyperion_ctrl -iface wlp1s0 -telemetry -logfile /var/log/hyperion.log
 
 ```
 
-### Dynamic Reload (Zero Downtime)
+> [!TIP]
+> **Dynamic Reload (Zero Downtime)**
+> You can modify `signatures.txt` while the engine is running. Trigger a hot-reload using `SIGHUP` to update the BPF Map instantly without dropping packets.
+> ```bash
+> echo "malware" >> signatures.txt
+> sudo pkill -HUP hyperion_ctrl
+> 
+> ```
+> 
+> 
 
-Modify `signatures.txt` while the engine is running and trigger a hot-reload using `pkill`. The engine will update the BPF Map instantly.
+## Citation
 
-```bash
-# Update rules
-echo "malware" >> signatures.txt
-
-# Send Signal to Hyperion Controller
-sudo pkill -HUP hyperion_ctrl
-
-```
-
-### Telemetry
-
-See [docs/TELEMETRY.md](https://www.google.com/search?q=docs/TELEMETRY.md) for detailed information about:
-
-* Event types and schema
-* 5-tuple flow tracking
-* CLI usage and options
-* API reference for telemetry consumers
-
----
-
-## [ 0x07 ] CITATION
-
-```text
+```bibtex
 @software{hyperion2026,
-  author = {Nevin},
+  author = {Nevin Shine},
   title = {Hyperion: High-Performance XDP Firewall},
   year = {2026},
-  url = {[https://github.com/nevinshine/hyperion-xdp](https://github.com/nevinshine/hyperion-xdp)}
+  url = {https://github.com/nevinshine/hyperion-xdp}
 }
 
 ```
 
 ---
 
-<div align="center">
-<sub>Research Author: Nevin | Lab: Systems Security Research</sub>
-</div>
+Nevin Shine (System Security Student) @ 2026
