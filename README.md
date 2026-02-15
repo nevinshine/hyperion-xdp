@@ -1,9 +1,3 @@
-Here is the professional, research-grade `README.md` for **Hyperion XDP**.
-
-I have removed the ASCII art console entirely and formatted it to strictly match the academic style of your **Sentinel-CC** documentation.
-
----
-
 # Hyperion XDP: Kernel-Space Defense Engine
 
 **High-Performance Network Security Engine (eBPF/XDP)**
