@@ -3,6 +3,7 @@
 #include <linux/if_ether.h>
 #include <linux/ip.h>
 #include <linux/tcp.h>
+#include <linux/udp.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
@@ -62,6 +63,15 @@ struct {
     __uint(max_entries, MAX_RULES);
 } policy_map SEC(".maps");
 
+// M4: IP Blocklist Map (Layer 2 drop)
+// LRU_HASH prevents Map Exhaustion (E2BIG) by automatically evicting oldest
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __type(key, __u32);
+    __type(value, __u8); // Flag/Dummy
+    __uint(max_entries, 65536);
+} blocklist_map SEC(".maps");
+
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 1 << 14); 
@@ -105,20 +115,50 @@ int hyperion_filter(struct xdp_md *ctx) {
     if (ip->ihl < 5) return XDP_PASS; 
     c.pos += ip->ihl * 4;
 
-    if (ip->protocol != IPPROTO_TCP) return XDP_PASS;
+    // M4: Layer 2 IP Blocklist check (O(1) Hash Map)
+    __u32 src_ip = ip->saddr;
+    __u8 *is_blocked = bpf_map_lookup_elem(&blocklist_map, &src_ip);
+    if (is_blocked) {
+        // Emit Telemetry for the drop
+        struct hyp_event *ev = bpf_ringbuf_reserve(&telemetry_ringbuf, sizeof(*ev), 0);
+        if (ev) {
+            ev->event_type = 1; // DROP
+            ev->src_ip = ip->saddr;
+            ev->dst_ip = ip->daddr;
+            ev->src_port = 0; // Unknown at this stage
+            ev->dst_port = 0;
+            ev->protocol = ip->protocol;
+            ev->timestamp = bpf_ktime_get_ns();
+            // memset signature
+            for (int i = 0; i < 8; i++) ev->signature[i] = 0;
+            bpf_ringbuf_submit(ev, 0);
+        }
+        return XDP_DROP;
+    }
 
-    // 3. TCP
-    struct tcphdr *tcp = c.pos;
-    if ((void *)(tcp + 1) > c.end) return XDP_PASS;
-    c.pos += tcp->doff * 4;
-    
     // M5: Update flow tracking
     struct flow_key fkey = {};
     fkey.src_ip = ip->saddr;
     fkey.dst_ip = ip->daddr;
-    fkey.src_port = tcp->source;
-    fkey.dst_port = tcp->dest;
     fkey.protocol = ip->protocol;
+
+    if (ip->protocol == IPPROTO_TCP) {
+        // 3. TCP
+        struct tcphdr *tcp = c.pos;
+        if ((void *)(tcp + 1) > c.end) return XDP_PASS;
+        c.pos += tcp->doff * 4;
+        fkey.src_port = tcp->source;
+        fkey.dst_port = tcp->dest;
+    } else if (ip->protocol == IPPROTO_UDP) {
+        // 3. UDP
+        struct udphdr *udp = c.pos;
+        if ((void *)(udp + 1) > c.end) return XDP_PASS;
+        c.pos += sizeof(struct udphdr);
+        fkey.src_port = udp->source;
+        fkey.dst_port = udp->dest;
+    } else {
+        return XDP_PASS;
+    }
     
     __u64 now = bpf_ktime_get_ns();
     // Calculate packet length from data pointers
@@ -173,8 +213,8 @@ int hyperion_filter(struct xdp_md *ctx) {
                     evt->event_type = 2; // SIG_MATCH
                     evt->src_ip = ip->saddr;
                     evt->dst_ip = ip->daddr;
-                    evt->src_port = tcp->source;
-                    evt->dst_port = tcp->dest;
+                    evt->src_port = fkey.src_port;
+                    evt->dst_port = fkey.dst_port;
                     evt->protocol = ip->protocol;
                     evt->timestamp = now;
                     
@@ -191,8 +231,8 @@ int hyperion_filter(struct xdp_md *ctx) {
                 if (e) {
                     e->src_ip = ip->saddr;
                     e->dst_ip = ip->daddr;
-                    e->src_port = tcp->source;
-                    e->dst_port = tcp->dest;
+                    e->src_port = fkey.src_port;
+                    e->dst_port = fkey.dst_port;
                     e->action = 1; // DROP
                     
                     // Safe Copy for Alert Log
@@ -212,8 +252,8 @@ int hyperion_filter(struct xdp_md *ctx) {
                     evt->event_type = 1; // DROP
                     evt->src_ip = ip->saddr;
                     evt->dst_ip = ip->daddr;
-                    evt->src_port = tcp->source;
-                    evt->dst_port = tcp->dest;
+                    evt->src_port = fkey.src_port;
+                    evt->dst_port = fkey.dst_port;
                     evt->protocol = ip->protocol;
                     evt->timestamp = now;
                     
@@ -237,8 +277,8 @@ int hyperion_filter(struct xdp_md *ctx) {
         evt->event_type = 0; // ACCEPT
         evt->src_ip = ip->saddr;
         evt->dst_ip = ip->daddr;
-        evt->src_port = tcp->source;
-        evt->dst_port = tcp->dest;
+        evt->src_port = fkey.src_port;
+        evt->dst_port = fkey.dst_port;
         evt->protocol = ip->protocol;
         evt->timestamp = now;
         

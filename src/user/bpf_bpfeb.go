@@ -89,6 +89,7 @@ type bpfProgramSpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type bpfMapSpecs struct {
 	AlertRingbuf     *ebpf.MapSpec `ebpf:"alert_ringbuf"`
+	BlocklistMap     *ebpf.MapSpec `ebpf:"blocklist_map"`
 	FlowMap          *ebpf.MapSpec `ebpf:"flow_map"`
 	PolicyMap        *ebpf.MapSpec `ebpf:"policy_map"`
 	TelemetryRingbuf *ebpf.MapSpec `ebpf:"telemetry_ringbuf"`
@@ -121,6 +122,7 @@ func (o *bpfObjects) Close() error {
 // It can be passed to loadBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type bpfMaps struct {
 	AlertRingbuf     *ebpf.Map `ebpf:"alert_ringbuf"`
+	BlocklistMap     *ebpf.Map `ebpf:"blocklist_map"`
 	FlowMap          *ebpf.Map `ebpf:"flow_map"`
 	PolicyMap        *ebpf.Map `ebpf:"policy_map"`
 	TelemetryRingbuf *ebpf.Map `ebpf:"telemetry_ringbuf"`
@@ -129,6 +131,7 @@ type bpfMaps struct {
 func (m *bpfMaps) Close() error {
 	return _BpfClose(
 		m.AlertRingbuf,
+		m.BlocklistMap,
 		m.FlowMap,
 		m.PolicyMap,
 		m.TelemetryRingbuf,

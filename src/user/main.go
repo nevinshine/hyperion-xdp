@@ -133,6 +133,9 @@ func main() {
         fmt.Printf("%s[+] Logging events to: %s%s\n", ColorGreen, *logfileFlag, ColorReset)
     }
 
+    // 4.5. Start IPC Server for Cortex M4 Bridge
+    go StartIPCServer(objs.PolicyMap, objs.BlocklistMap)
+
     // 5. Legacy Telemetry Loop (alert_ringbuf)
     rd, err := ringbuf.NewReader(objs.AlertRingbuf)
     if err != nil {
@@ -239,6 +242,7 @@ func main() {
             }
         case syscall.SIGINT, syscall.SIGTERM:
             fmt.Printf("\n%s[-] Shutting down Hyperion.%s\n", ColorRed, ColorReset)
+            os.Remove("/tmp/hyperion.sock") // M4: Graceful IPC teardown
             return
         }
     }
