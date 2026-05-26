@@ -9,11 +9,16 @@ import (
     "fmt"
     "log"
     "net"
+    "net/http"
     "os"
     "os/signal"
     "strings"
     "syscall"
     "time"
+
+    "github.com/prometheus/client_golang/prometheus"
+    "github.com/prometheus/client_golang/prometheus/promauto"
+    "github.com/prometheus/client_golang/prometheus/promhttp"
 
     "github.com/cilium/ebpf"
     "github.com/cilium/ebpf/link"
@@ -72,6 +77,17 @@ type AlertEvent struct {
 
 var loadedSigs []string
 var bootTimeOffset int64 // Boot time offset to convert bpf_ktime_get_ns() to Unix time
+
+// --- PROMETHEUS METRICS ---
+var (
+    metricXdpDrops = promauto.NewCounterVec(
+        prometheus.CounterOpts{
+            Name: "sentinel_xdp_drops_total",
+            Help: "Total number of XDP packet drops",
+        },
+        []string{"reason"},
+    )
+)
 
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc $BPF_CLANG -cflags $BPF_CFLAGS bpf ../kern/hyperion_core.c -- -I../common
 
@@ -132,6 +148,15 @@ func main() {
         defer logFile.Close()
         fmt.Printf("%s[+] Logging events to: %s%s\n", ColorGreen, *logfileFlag, ColorReset)
     }
+
+    // 4.1. Start Prometheus Endpoint
+    go func() {
+        http.Handle("/metrics", promhttp.Handler())
+        fmt.Printf("%s[+] Prometheus metrics available on :2112/metrics%s\n", ColorGreen, ColorReset)
+        if err := http.ListenAndServe(":2112", nil); err != nil {
+            log.Printf("Prometheus server stopped: %v", err)
+        }
+    }()
 
     // 4.5. Start IPC Server for Cortex M4 Bridge
     go StartIPCServer(objs.PolicyMap, objs.BlocklistMap)
@@ -215,6 +240,13 @@ func main() {
                 // Format the event
                 eventStr := formatTelemetryEvent(&event)
                 
+                // Prometheus Metrics Integration
+                if event.EventType == 1 {
+                    metricXdpDrops.WithLabelValues("ip_blocklist").Inc()
+                } else if event.EventType == 2 {
+                    metricXdpDrops.WithLabelValues("signature_match").Inc()
+                }
+
                 // Print to stdout
                 fmt.Println(eventStr)
                 
