@@ -401,7 +401,7 @@ cd src/user && go test -bench=. -benchmem
 | Execution Layer | Sentinel Component | Primary Technology & Enforcement | Strategic Objective |
 |:------|:------|:------|:------|
 | Ring -1 (Hypervisor) | `sentinel-vmi` | AMD-V / NPT Guard / ARMv8 EL2 | Out-of-band Hypervisor Introspection, memory monitoring |
-| Ring 0 (Compile) | `sentinel-cc` | LLVM / Policy-Carrying Code | Compile-time intent validation, Deep CFI, ASLR-aware enforcement |
+| Ring 0 (Compile) | `sentinel-cc` | LLVM / Policy-Carrying Code | Compile-time intent validation, Call-Stack CFI, ASLR-aware enforcement |
 | Ring 0 (Runtime) | `telos-runtime` | eBPF-LSM | Intent correlation, Information Flow Control (IFC), and Taint Tracking |
 | Ring 0 (Runtime) | Sentinel RT | Seccomp / eBPF / io_uring | Host Intrusion Detection System (HIDS), Citadel recursive tracking |
 | **Wire / Physical NIC** | **`hyperion-xdp`** | XDP / eBPF | Wire-speed network drop and proxy enforcement |
