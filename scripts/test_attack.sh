@@ -29,7 +29,7 @@ fi
 
 echo -e "\n[*] Streaming malicious test signature from Attacker..."
 # Sending string signature containing target malicious patterns
-echo "ATTACK_SIGNATURE_PAYLOAD_DROP_TEST" | ip netns exec attacker nc -w 1 $VICTIM_IP $PORT || true
+echo "GET /login?user=root HTTP/1.1" | ip netns exec attacker nc -w 1 $VICTIM_IP $PORT || true
 
 sleep 0.5
 
