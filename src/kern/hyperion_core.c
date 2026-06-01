@@ -199,7 +199,7 @@ int hyperion_filter(struct xdp_md *ctx) {
             int name_idx = 0;
             
             #pragma unroll
-            for (int i = 0; i < MAX_DNS_LABELS; i++) {
+            for (int i = 0; i < 3; i++) {
                 if ((void *)(cursor + 1) > c.end) break;
                 __u8 label_len = *cursor;
                 
@@ -221,17 +221,21 @@ int hyperion_filter(struct xdp_md *ctx) {
                 }
                 
                 cursor++; // Move past length byte
-                if ((void *)(cursor + label_len) > c.end) break;
                 
-                // Copy the label characters into our key
-                for (int j = 0; j < 32; j++) { 
-                    if (j >= label_len) break;
-                    if ((void *)(cursor + j + 1) > c.end) break;
-                    if (name_idx < MAX_DNS_NAME_LEN - 1) {
+                // Static verifier bound check: Ensure at least 15 bytes remain in the packet
+                // to allow unconditional reading in the unrolled loop without branching explosion.
+                if ((void *)(cursor + 15) > c.end) break;
+                
+                // Copy up to 15 characters linearly
+                #pragma unroll
+                for (int j = 0; j < 15; j++) { 
+                    if (j < label_len && name_idx < MAX_DNS_NAME_LEN - 1) {
                         qname_key.name[name_idx++] = cursor[j];
                     }
                 }
                 
+                // Safely advance the cursor by the true label length
+                if ((void *)(cursor + label_len) > c.end) break;
                 cursor += label_len;
             }
         }
