@@ -28,8 +28,9 @@ else
 fi
 
 echo -e "\n[*] Streaming malicious test signature from Attacker..."
-# Sending string signature containing target malicious patterns
-echo "GET /login?user=root HTTP/1.1" | ip netns exec attacker nc -w 1 $VICTIM_IP $PORT || true
+# The eBPF signature matcher checks the FIRST 4 bytes of the payload.
+# We must start the payload with the exact signature ('root') for it to match.
+echo "root_shell_exploit_payload" | ip netns exec attacker nc -w 1 $VICTIM_IP $PORT || true
 
 sleep 0.5
 
