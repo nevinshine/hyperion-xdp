@@ -8,12 +8,27 @@
 #include <bpf/bpf_endian.h>
 
 #define MAX_RULES 2
+#define MAX_DNS_NAME_LEN 64
+#define MAX_DNS_LABELS 5
 
 struct policy_t {
     __u8 signature[8];
     __u8 sig_len;
     __u8 active;
     __u8 _pad[2]; 
+};
+
+struct dnshdr {
+    __be16 id;
+    __be16 flags;
+    __be16 qdcount;
+    __be16 ancount;
+    __be16 nscount;
+    __be16 arcount;
+};
+
+struct dns_name_key {
+    __u8 name[MAX_DNS_NAME_LEN];
 };
 
 // M5: New telemetry event structure
@@ -72,6 +87,14 @@ struct {
     __uint(max_entries, 65536);
 } blocklist_map SEC(".maps");
 
+// M6: Layer 7 DNS Blocklist Map
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, struct dns_name_key);
+    __type(value, __u8); // 1 = blocked
+    __uint(max_entries, 10000);
+} dns_blocklist_map SEC(".maps");
+
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 1 << 14); 
@@ -96,6 +119,26 @@ struct cursor {
     void *end;
 };
 
+static __attribute__((noinline)) void emit_telemetry(__u8 type, struct flow_key *fkey, __u8 *sig) {
+    struct hyp_event *evt = bpf_ringbuf_reserve(&telemetry_ringbuf, sizeof(*evt), 0);
+    if (!evt) return;
+    evt->event_type = type;
+    evt->src_ip = fkey->src_ip;
+    evt->dst_ip = fkey->dst_ip;
+    evt->src_port = fkey->src_port;
+    evt->dst_port = fkey->dst_port;
+    evt->protocol = fkey->protocol;
+    evt->timestamp = bpf_ktime_get_ns();
+    if (sig) {
+        #pragma unroll
+        for (int k = 0; k < 8; k++) evt->signature[k] = sig[k];
+    } else {
+        #pragma unroll
+        for (int k = 0; k < 8; k++) evt->signature[k] = 0;
+    }
+    bpf_ringbuf_submit(evt, 0);
+}
+
 SEC("xdp")
 int hyperion_filter(struct xdp_md *ctx) {
     struct cursor c;
@@ -115,32 +158,19 @@ int hyperion_filter(struct xdp_md *ctx) {
     if (ip->ihl < 5) return XDP_PASS; 
     c.pos += ip->ihl * 4;
 
-    // M4: Layer 2 IP Blocklist check (O(1) Hash Map)
-    __u32 src_ip = ip->saddr;
-    __u8 *is_blocked = bpf_map_lookup_elem(&blocklist_map, &src_ip);
-    if (is_blocked) {
-        // Emit Telemetry for the drop
-        struct hyp_event *ev = bpf_ringbuf_reserve(&telemetry_ringbuf, sizeof(*ev), 0);
-        if (ev) {
-            ev->event_type = 1; // DROP
-            ev->src_ip = ip->saddr;
-            ev->dst_ip = ip->daddr;
-            ev->src_port = 0; // Unknown at this stage
-            ev->dst_port = 0;
-            ev->protocol = ip->protocol;
-            ev->timestamp = bpf_ktime_get_ns();
-            // memset signature
-            for (int i = 0; i < 8; i++) ev->signature[i] = 0;
-            bpf_ringbuf_submit(ev, 0);
-        }
-        return XDP_DROP;
-    }
-
     // M5: Update flow tracking
     struct flow_key fkey = {};
     fkey.src_ip = ip->saddr;
     fkey.dst_ip = ip->daddr;
     fkey.protocol = ip->protocol;
+
+    // M4: Layer 2 IP Blocklist check (O(1) Hash Map)
+    __u32 src_ip = ip->saddr;
+    __u8 *is_blocked = bpf_map_lookup_elem(&blocklist_map, &src_ip);
+    if (is_blocked) {
+        emit_telemetry(1, &fkey, NULL);
+        return XDP_DROP;
+    }
 
     if (ip->protocol == IPPROTO_TCP) {
         // 3. TCP
@@ -156,6 +186,55 @@ int hyperion_filter(struct xdp_md *ctx) {
         c.pos += sizeof(struct udphdr);
         fkey.src_port = udp->source;
         fkey.dst_port = udp->dest;
+
+        // M6: L7 DNS Payload Inspection
+        // Parse DNS query on UDP port 53
+        if (udp->dest == bpf_htons(53)) {
+            struct dnshdr *dns = c.pos;
+            if ((void *)(dns + 1) > c.end) return XDP_PASS; // Bound check DNS header
+            c.pos += sizeof(struct dnshdr);
+            
+            __u8 *cursor = (__u8 *)c.pos;
+            struct dns_name_key qname_key = {}; // Zero initialize key for verifier
+            int name_idx = 0;
+            
+            #pragma unroll
+            for (int i = 0; i < MAX_DNS_LABELS; i++) {
+                if ((void *)(cursor + 1) > c.end) break;
+                __u8 label_len = *cursor;
+                
+                if (name_idx < MAX_DNS_NAME_LEN - 1) {
+                    qname_key.name[name_idx++] = label_len;
+                }
+
+                if (label_len == 0) {
+                    // Reached end of QNAME, lookup in blocklist map
+                    __u8 *blocked = bpf_map_lookup_elem(&dns_blocklist_map, &qname_key);
+                    if (blocked && *blocked == 1) {
+                        __u8 sig_snippet[8] = {0};
+                        #pragma unroll
+                        for (int k = 0; k < 8; k++) sig_snippet[k] = qname_key.name[k];
+                        emit_telemetry(1, &fkey, sig_snippet);
+                        return XDP_DROP;
+                    }
+                    break;
+                }
+                
+                cursor++; // Move past length byte
+                if ((void *)(cursor + label_len) > c.end) break;
+                
+                // Copy the label characters into our key
+                for (int j = 0; j < 32; j++) { 
+                    if (j >= label_len) break;
+                    if ((void *)(cursor + j + 1) > c.end) break;
+                    if (name_idx < MAX_DNS_NAME_LEN - 1) {
+                        qname_key.name[name_idx++] = cursor[j];
+                    }
+                }
+                
+                cursor += label_len;
+            }
+        }
     } else {
         return XDP_PASS;
     }
@@ -207,24 +286,12 @@ int hyperion_filter(struct xdp_md *ctx) {
                 data[2] == pol->signature[2] &&
                 data[3] == pol->signature[3]) {
                 
-                // M5: Emit SIG_MATCH telemetry event
-                struct hyp_event *evt = bpf_ringbuf_reserve(&telemetry_ringbuf, sizeof(*evt), 0);
-                if (evt) {
-                    evt->event_type = 2; // SIG_MATCH
-                    evt->src_ip = ip->saddr;
-                    evt->dst_ip = ip->daddr;
-                    evt->src_port = fkey.src_port;
-                    evt->dst_port = fkey.dst_port;
-                    evt->protocol = ip->protocol;
-                    evt->timestamp = now;
-                    
-                    // Copy matched signature
-                    #pragma unroll
-                    for (int k = 0; k < 8; k++) {
-                        evt->signature[k] = pol->signature[k];
-                    }
-                    bpf_ringbuf_submit(evt, 0);
-                }
+                __u8 sig_snippet[8] = {0};
+                #pragma unroll
+                for (int k = 0; k < 8; k++) sig_snippet[k] = pol->signature[k];
+
+                // M5: Emit SIG_MATCH and DROP telemetry events
+                emit_telemetry(2, &fkey, sig_snippet);
                 
                 // Found a match! Trigger Alert (legacy)
                 struct event_t *e = bpf_ringbuf_reserve(&alert_ringbuf, sizeof(*e), 0);
@@ -246,49 +313,14 @@ int hyperion_filter(struct xdp_md *ctx) {
                     bpf_ringbuf_submit(e, 0);
                 }
                 
-                // M5: Emit DROP telemetry event
-                evt = bpf_ringbuf_reserve(&telemetry_ringbuf, sizeof(*evt), 0);
-                if (evt) {
-                    evt->event_type = 1; // DROP
-                    evt->src_ip = ip->saddr;
-                    evt->dst_ip = ip->daddr;
-                    evt->src_port = fkey.src_port;
-                    evt->dst_port = fkey.dst_port;
-                    evt->protocol = ip->protocol;
-                    evt->timestamp = now;
-                    
-                    // Copy matched signature for context
-                    #pragma unroll
-                    for (int k = 0; k < 8; k++) {
-                        evt->signature[k] = pol->signature[k];
-                    }
-                    bpf_ringbuf_submit(evt, 0);
-                }
-                
+                emit_telemetry(1, &fkey, sig_snippet);
                 return XDP_DROP;
             }
         }
     }
 
     // M5: Emit ACCEPT telemetry event for packets that pass
-    // This happens regardless of whether the packet has payload
-    struct hyp_event *evt = bpf_ringbuf_reserve(&telemetry_ringbuf, sizeof(*evt), 0);
-    if (evt) {
-        evt->event_type = 0; // ACCEPT
-        evt->src_ip = ip->saddr;
-        evt->dst_ip = ip->daddr;
-        evt->src_port = fkey.src_port;
-        evt->dst_port = fkey.dst_port;
-        evt->protocol = ip->protocol;
-        evt->timestamp = now;
-        
-        // No signature for ACCEPT events
-        #pragma unroll
-        for (int k = 0; k < 8; k++) {
-            evt->signature[k] = 0;
-        }
-        bpf_ringbuf_submit(evt, 0);
-    }
+    emit_telemetry(0, &fkey, NULL);
 
     return XDP_PASS;
 }
