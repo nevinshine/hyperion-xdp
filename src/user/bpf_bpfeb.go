@@ -13,6 +13,11 @@ import (
 	"github.com/cilium/ebpf"
 )
 
+type bpfDnsNameKey struct {
+	_    structs.HostLayout
+	Name [64]uint8
+}
+
 type bpfFlowKey struct {
 	_        structs.HostLayout
 	SrcIp    uint32
@@ -90,6 +95,7 @@ type bpfProgramSpecs struct {
 type bpfMapSpecs struct {
 	AlertRingbuf     *ebpf.MapSpec `ebpf:"alert_ringbuf"`
 	BlocklistMap     *ebpf.MapSpec `ebpf:"blocklist_map"`
+	DnsBlocklistMap  *ebpf.MapSpec `ebpf:"dns_blocklist_map"`
 	FlowMap          *ebpf.MapSpec `ebpf:"flow_map"`
 	PolicyMap        *ebpf.MapSpec `ebpf:"policy_map"`
 	TelemetryRingbuf *ebpf.MapSpec `ebpf:"telemetry_ringbuf"`
@@ -123,6 +129,7 @@ func (o *bpfObjects) Close() error {
 type bpfMaps struct {
 	AlertRingbuf     *ebpf.Map `ebpf:"alert_ringbuf"`
 	BlocklistMap     *ebpf.Map `ebpf:"blocklist_map"`
+	DnsBlocklistMap  *ebpf.Map `ebpf:"dns_blocklist_map"`
 	FlowMap          *ebpf.Map `ebpf:"flow_map"`
 	PolicyMap        *ebpf.Map `ebpf:"policy_map"`
 	TelemetryRingbuf *ebpf.Map `ebpf:"telemetry_ringbuf"`
@@ -132,6 +139,7 @@ func (m *bpfMaps) Close() error {
 	return _BpfClose(
 		m.AlertRingbuf,
 		m.BlocklistMap,
+		m.DnsBlocklistMap,
 		m.FlowMap,
 		m.PolicyMap,
 		m.TelemetryRingbuf,

@@ -13,7 +13,7 @@ all: build
 build:
 	@mkdir -p $(BIN_DIR)
 	@echo "  [BPF] Generating Artifacts..."
-	cd src/user && $(GO) generate
+	cd src/user && env -u GOARCH $(GO) generate
 	@echo "  [GO] Compiling Controller..."
 	$(GO) build -o $(BIN_DIR)/$(BIN_NAME) ./src/user
 
