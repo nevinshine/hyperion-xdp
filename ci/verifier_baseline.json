@@ -1,0 +1,10 @@
+{
+  "kernel": "6.x",
+  "program": "hyperion_filter",
+  "instruction_count": 136,
+  "stack_depth": 32,
+  "verifier_complexity": 11,
+  "helper_calls": 13,
+  "last_updated": "2026-06-03",
+  "commit": ""
+}

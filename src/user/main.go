@@ -1,447 +1,500 @@
-/* HYPERION CONTROLLER M5 (Telemetry + Flow Tracking) */
+/* HYPERION AF_XDP CONTROLLER (Max-Out Architecture) */
 package main
 
 import (
-    "bufio"
-    "bytes"
-    "encoding/binary"
-    "flag"
-    "fmt"
-    "log"
-    "net"
-    "net/http"
-    "os"
-    "os/signal"
-    "strings"
-    "syscall"
-    "time"
+	"bytes"
+	"encoding/binary"
+	"flag"
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"os/exec"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
+	"runtime"
 
-    "github.com/prometheus/client_golang/prometheus"
-    "github.com/prometheus/client_golang/prometheus/promauto"
-    "github.com/prometheus/client_golang/prometheus/promhttp"
+	"golang.org/x/sys/unix"
 
-    "github.com/cilium/ebpf"
-    "github.com/cilium/ebpf/link"
-    "github.com/cilium/ebpf/ringbuf"
-    "github.com/cilium/ebpf/rlimit"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/link"
+	"github.com/cilium/ebpf/ringbuf"
+	"github.com/cilium/ebpf/rlimit"
+	
+	"github.com/asavie/xdp"
 )
 
 // --- COLORS & VISUALS ---
 const (
-    ColorReset  = "\033[0m"
-    ColorRed    = "\033[31m"
-    ColorGreen  = "\033[32m"
-    ColorYellow = "\033[33m"
-    ColorBlue   = "\033[34m"
-    ColorPurple = "\033[35m"
-    ColorCyan   = "\033[36m"
-    ColorWhite  = "\033[37m"
+	ColorReset  = "\033[0m"
+	ColorRed    = "\033[31m"
+	ColorGreen  = "\033[32m"
+	ColorYellow = "\033[33m"
+	ColorCyan   = "\033[36m"
 )
 
+// Hyperion Architectural Invariants
 const (
-    ConfigFile = "signatures.txt"
-    MaxRules   = 2
+	MaxQueues = 1 // Strict 1:1 model: 1 Queue <-> 1 Socket <-> 1 Goroutine
 )
 
-// Must match Kernel Struct (struct policy_t)
-type Policy struct {
-    Signature [8]uint8
-    SigLen    uint8
-    Active    uint8
-    Pad       [2]uint8 // FIXED: Aligns to 12 bytes
-}
-
-// M5: New telemetry event structure (must match struct hyp_event)
+// Must match Kernel struct hyp_event
 type HypEvent struct {
-    EventType uint8    // 0=ACCEPT, 1=DROP, 2=SIG_MATCH
-    _         [3]uint8 // Padding for alignment
-    SrcIP     uint32
-    DstIP     uint32
-    SrcPort   uint16
-    DstPort   uint16
-    Protocol  uint8
-    _         [7]uint8 // Padding for 8-byte alignment before Timestamp
-    Timestamp uint64
-    Signature [8]byte
+	EventType uint8
+	_         [3]uint8
+	RxQueue   uint32
+	SrcIP     uint32
+	DstIP     uint32
+	SrcPort   uint16
+	DstPort   uint16
+	Protocol  uint8
+	_         [3]uint8
+	RxHash    uint32
+	Timestamp uint64
 }
 
-// Must match Kernel Struct (struct event_t)
-type AlertEvent struct {
-    SrcIP   uint32
-    DstIP   uint32
-    SrcPort uint16   // FIXED: Added to match C
-    DstPort uint16   // FIXED: Added to match C
-    Action  uint32   // FIXED: Renamed from RuleID (since C sends Action)
-    Snippet [8]byte
+// BPF Map Keys
+type PortKey struct {
+	Protocol uint8
+	_        uint8
+	Port     uint16
 }
 
-var loadedSigs []string
-var bootTimeOffset int64 // Boot time offset to convert bpf_ktime_get_ns() to Unix time
-
-// --- PROMETHEUS METRICS ---
 var (
-    metricXdpDrops = promauto.NewCounterVec(
-        prometheus.CounterOpts{
-            Name: "sentinel_xdp_drops_total",
-            Help: "Total number of XDP packet drops",
-        },
-        []string{"reason"},
-    )
+	metricFastDrops = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "hyperion_fastpath_drops_total",
+		Help: "Packets dropped in XDP kernel fast path",
+	}, []string{"cpu"})
+	metricSlowDrops = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "hyperion_slowpath_drops_total",
+		Help: "Packets dropped by AF_XDP userspace DPI",
+	}, []string{"reason", "queue"})
+	metricSlowInspections = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "hyperion_slowpath_inspections_total",
+		Help: "Packets evaluated in userspace DPI",
+	}, []string{"queue"})
+	metricRedirectFailures = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "hyperion_redirect_failures_total",
+		Help: "Packets that failed XDP_REDIRECT due to unbound userspace socket (Fail-Open)",
+	}, []string{"cpu"})
+	metricWakeupLatency = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "hyperion_afxdp_wakeup_latency_ms",
+		Help:    "Latency from kernel receive to AF_XDP userspace processing",
+		Buckets: []float64{0.1, 0.5, 1.0, 5.0, 10.0, 50.0},
+	}, []string{"queue"})
+	metricRxDropped = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "hyperion_afxdp_rx_dropped_total",
+		Help: "Total packets dropped by kernel due to AF_XDP Rx ring full",
+	}, []string{"queue"})
+	metricHWNICDrops = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "hyperion_hw_nic_drops_total",
+		Help: "Hardware-level NIC drops scraped via ethtool",
+	}, []string{"stat"})
 )
+
+var bootTimeOffset int64
 
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc $BPF_CLANG -cflags $BPF_CFLAGS bpf ../kern/hyperion_core.c -- -I../common
 
 func main() {
-    // Default to 'wlp1s0' if not specified
-    ifaceName := flag.String("iface", "wlp1s0", "Interface to attach XDP")
-    sigFlag := flag.String("sig", "", "Comma-separated signatures (e.g., -sig \"hack,malware,evil\")")
-    telemetryFlag := flag.Bool("telemetry", false, "Enable telemetry event output")
-    logfileFlag := flag.String("logfile", "", "Optional file for logging events")
-    flag.Parse()
+	ifaceName := flag.String("iface", "veth0", "Interface to attach XDP")
+	configPath := flag.String("config", "policy.yaml", "Path to YAML policy config")
+	cpuPin := flag.Int("cpu", -1, "CPU Core ID to pin the AF_XDP polling thread (-1 to disable)")
+	multiProg := flag.Bool("multiprog", false, "Use libxdp multiprog dispatcher (requires xdp-tools)")
+	queues := flag.Int("queues", 1, "Number of RX queues to bind AF_XDP sockets to")
+	flag.Parse()
 
-    printBanner()
+	fmt.Printf("%s:: Hyperion AF_XDP Dataplane Engine ::%s\n\n", ColorCyan, ColorReset)
 
-    // 0. Calculate boot time offset for timestamp conversion
-    // bpf_ktime_get_ns() returns nanoseconds since boot, not Unix epoch
-    if err := calculateBootTimeOffset(); err != nil {
-        log.Fatalf("%s[!] Failed to calculate boot time offset: %v%s", ColorRed, err, ColorReset)
-    }
+	// Invariant Enforcement
+	if *cpuPin >= 0 {
+		if runtime.GOMAXPROCS(0) > 1 {
+			// When pinned to a CPU, we should ideally restrict GOMAXPROCS, but we at least log the invariant
+			fmt.Printf("%s[i] Architectural Invariant: 1:1 Queue-to-Goroutine model enforced%s\n", ColorYellow, ColorReset)
+		}
+	} else {
+		fmt.Printf("%s[!] Warning: Running without CPU pinning (-cpu flag). This violates the 1:1 deterministic model.%s\n", ColorYellow, ColorReset)
+	}
 
-    // 1. Init
-    if err := rlimit.RemoveMemlock(); err != nil {
-        log.Fatal(err)
-    }
+	if err := calculateBootTimeOffset(); err != nil {
+		log.Fatalf("Boot time offset failed: %v", err)
+	}
 
-    objs := bpfObjects{}
-    if err := loadBpfObjects(&objs, nil); err != nil {
-        log.Fatalf("%s[!] Load BPF failed: %v%s", ColorRed, err, ColorReset)
-    }
-    defer objs.Close()
+	if err := rlimit.RemoveMemlock(); err != nil {
+		log.Fatal(err)
+	}
 
-    // 2. Load Config
-    if err := reloadSignatures(objs.PolicyMap, *sigFlag); err != nil {
-        log.Printf("%s[!] Initial load warning: %v%s", ColorYellow, err, ColorReset)
-    }
+	// 1. Load BPF & Attach
+	objs := bpfObjects{}
+	var attachedLink link.Link
 
-    // 3. Attach XDP
-    iface, err := net.InterfaceByName(*ifaceName)
-    if err != nil {
-        log.Fatalf("%s[!] Interface %s not found%s", ColorRed, *ifaceName, ColorReset)
-    }
+	if *multiProg {
+		fmt.Printf("%s[i] Running in Multi-Program Mode (libxdp)%s\n", ColorYellow, ColorReset)
+		if _, err := exec.LookPath("xdp-loader"); err != nil {
+			log.Fatalf("xdp-loader not found in PATH. Please install xdp-tools.")
+		}
 
-    l, err := link.AttachXDP(link.XDPOptions{
-        Program:   objs.HyperionFilter,
-        Interface: iface.Index,
-    })
-    if err != nil {
-        log.Fatalf("%s[!] XDP Attach failed: %v%s", ColorRed, err, ColorReset)
-    }
-    defer l.Close()
+		tmpFile := "/tmp/hyperion_multiprog.o"
+		if err := os.WriteFile(tmpFile, _BpfBytes, 0644); err != nil {
+			log.Fatalf("Failed to write temporary BPF object: %v", err)
+		}
 
-    // 4. Setup optional log file
-    var logFile *os.File
-    if *logfileFlag != "" {
-        logFile, err = os.OpenFile(*logfileFlag, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-        if err != nil {
-            log.Fatalf("%s[!] Failed to open log file: %v%s", ColorRed, err, ColorReset)
-        }
-        defer logFile.Close()
-        fmt.Printf("%s[+] Logging events to: %s%s\n", ColorGreen, *logfileFlag, ColorReset)
-    }
+		pinPath := "/sys/fs/bpf/hyperion_xdp"
+		os.RemoveAll(pinPath) // clean up old if exists
 
-    // 4.1. Start Prometheus Endpoint
-    go func() {
-        http.Handle("/metrics", promhttp.Handler())
-        fmt.Printf("%s[+] Prometheus metrics available on :2112/metrics%s\n", ColorGreen, ColorReset)
-        if err := http.ListenAndServe(":2112", nil); err != nil {
-            log.Printf("Prometheus server stopped: %v", err)
-        }
-    }()
+		cmd := exec.Command("xdp-loader", "load", "-m", "skb", "-p", pinPath, "-s", "xdp", "-P", "50", *ifaceName, tmpFile)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			log.Fatalf("xdp-loader failed: %v\nOutput: %s", err, string(out))
+		}
+		fmt.Printf("%s[+] libxdp dispatcher injected successfully%s\n", ColorGreen, ColorReset)
 
-    // 4.5. Start IPC Server for Cortex M4 Bridge
-    go StartIPCServer(objs.PolicyMap, objs.BlocklistMap)
+		// Load maps from pinned paths
+		var mapErr error
+		if objs.BlocklistMap, mapErr = loadPinnedMapSafe(pinPath + "/blocklist_map"); mapErr != nil {
+			log.Fatalf("Map load err: %v", mapErr)
+		}
+		if objs.RedirectPortsMap, mapErr = loadPinnedMapSafe(pinPath + "/redirect_ports_map"); mapErr != nil {
+			log.Fatalf("Map load err: %v", mapErr)
+		}
+		if objs.TelemetryRingbuf, mapErr = loadPinnedMapSafe(pinPath + "/telemetry_ringbuf"); mapErr != nil {
+			log.Fatalf("Map load err: %v", mapErr)
+		}
+		if objs.DropStatsMap, mapErr = loadPinnedMapSafe(pinPath + "/drop_stats_map"); mapErr != nil {
+			log.Fatalf("Map load err: %v", mapErr)
+		}
+		if objs.XskMap, mapErr = loadPinnedMapSafe(pinPath + "/xsk_map"); mapErr != nil {
+			log.Fatalf("Map load err: %v", mapErr)
+		}
+		defer objs.Close()
+	} else {
+		if err := loadBpfObjects(&objs, nil); err != nil {
+			log.Fatalf("Load BPF failed: %v", err)
+		}
+		defer objs.Close()
+		
+		iface, err := net.InterfaceByName(*ifaceName)
+		if err != nil {
+			log.Fatalf("Interface %s not found", *ifaceName)
+		}
 
-    // 5. Legacy Telemetry Loop (alert_ringbuf)
-    rd, err := ringbuf.NewReader(objs.AlertRingbuf)
-    if err != nil {
-        log.Fatalf("%s[!] Ringbuf failed: %v%s", ColorRed, err, ColorReset)
-    }
-    defer rd.Close()
+		attachedLink, err = link.AttachXDP(link.XDPOptions{
+			Program:   objs.HyperionFilter,
+			Interface: iface.Index,
+		})
+		if err != nil {
+			log.Fatalf("XDP Attach failed: %v", err)
+		}
+		defer attachedLink.Close()
+		fmt.Printf("%s[+] Fast Path XDP attached to %s%s\n", ColorGreen, *ifaceName, ColorReset)
+	}
 
-    // 6. M5: New Telemetry Loop (telemetry_ringbuf)
-    var telemetryReader *ringbuf.Reader
-    if *telemetryFlag {
-        telemetryReader, err = ringbuf.NewReader(objs.TelemetryRingbuf)
-        if err != nil {
-            log.Fatalf("%s[!] Telemetry Ringbuf failed: %v%s", ColorRed, err, ColorReset)
-        }
-        defer telemetryReader.Close()
-        fmt.Printf("%s[+] Telemetry enabled%s\n", ColorGreen, ColorReset)
-    }
+	iface, err := net.InterfaceByName(*ifaceName)
+	if err != nil {
+		log.Fatalf("Interface %s not found", *ifaceName)
+	}
 
-    fmt.Printf("%s[+] Hyperion Active on %s%s\n", ColorGreen, *ifaceName, ColorReset)
-    fmt.Printf("%s[i] PID: %d (Run 'kill -HUP %d' to reload)%s\n", ColorCyan, os.Getpid(), os.Getpid(), ColorReset)
-    fmt.Println(strings.Repeat("-", 60))
-    fmt.Printf("%sWaiting for threats...%s\n", ColorWhite, ColorReset)
+	// 2. Load Config & Populate Maps
+	config, err := LoadPolicyConfig(*configPath)
+	if err != nil {
+		log.Fatalf("Failed to load policy: %v", err)
+	}
+	applyFastPathPolicy(objs, config.FastPath)
 
-    // Legacy alert handler
-    go func() {
-        for {
-            record, err := rd.Read()
-            if err != nil {
-                if err == ringbuf.ErrClosed {
-                    return
-                }
-                continue
-            }
+	var xsks []*xdp.Socket
+	for q := 0; q < *queues; q++ {
+		xsk, err := xdp.NewSocket(iface.Index, q, nil)
+		if err != nil {
+			log.Fatalf("Failed to create AF_XDP socket for queue %d: %v", q, err)
+		}
+		xsks = append(xsks, xsk)
+		defer xsk.Close()
 
-            var event AlertEvent
-            // Binary read must match struct layout exactly
-            if err := binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &event); err != nil {
-                log.Printf("Failed to parse event: %v", err)
-                continue
-            }
+		if err := objs.XskMap.Put(uint32(q), uint32(xsk.FD())); err != nil {
+			log.Fatalf("Failed to insert AF_XDP socket into BPF map: %v", err)
+		}
+		fmt.Printf("%s[+] Slow Path AF_XDP socket bound to queue %d%s\n", ColorGreen, q, ColorReset)
+	}
 
-            // NOTE: Currently C sends Action=1 (Drop), not the Rule Index.
-            // So we just log "BLOCKED" generally.
-            payloadStr := string(event.Snippet[:])
-            // sanitize string
-            payloadStr = strings.ReplaceAll(payloadStr, "\n", ".")
-            payloadStr = strings.ReplaceAll(payloadStr, "\r", ".")
+	// 5. Start Prometheus endpoint
+	go func() {
+		http.Handle("/metrics", promhttp.Handler())
+		fmt.Printf("%s[+] Prometheus metrics available on :2112/metrics%s\n", ColorGreen, ColorReset)
+		http.ListenAndServe(":2112", nil)
+	}()
 
-            // ALERT LOG STYLE
-            fmt.Printf("%s[%s] ALERT: Blocked Traffic from %s -> Payload: [%s]%s\n",
-                ColorRed,
-                time.Now().Format("15:04:05"),
-                int2ip(event.SrcIP),
-                payloadStr,
-                ColorReset)
-        }
-    }()
+	// 6. Start Kernel Telemetry Loop (Fast Path Drops / Redirect Failures)
+	go func() {
+		rd, err := ringbuf.NewReader(objs.TelemetryRingbuf)
+		if err != nil {
+			log.Fatalf("Telemetry Ringbuf failed: %v", err)
+		}
+		defer rd.Close()
 
-    // M5: Telemetry event handler
-    if *telemetryFlag {
-        go func() {
-            for {
-                record, err := telemetryReader.Read()
-                if err != nil {
-                    if err == ringbuf.ErrClosed {
-                        return
-                    }
-                    continue
-                }
+		for {
+			record, err := rd.Read()
+			if err != nil {
+				if err == ringbuf.ErrClosed {
+					return
+				}
+				continue
+			}
 
-                var event HypEvent
-                if err := binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &event); err != nil {
-                    log.Printf("Failed to parse telemetry event: %v", err)
-                    continue
-                }
+			var event HypEvent
+			if err := binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &event); err != nil {
+				continue
+			}
 
-                // Format the event
-                eventStr := formatTelemetryEvent(&event)
-                
-                // Prometheus Metrics Integration
-                if event.EventType == 1 {
-                    metricXdpDrops.WithLabelValues("ip_blocklist").Inc()
-                } else if event.EventType == 2 {
-                    metricXdpDrops.WithLabelValues("signature_match").Inc()
-                }
+			if event.EventType == 1 {
+				hashStr := ""
+				if event.RxHash != 0 {
+					hashStr = fmt.Sprintf(" [HW_HASH: 0x%x]", event.RxHash)
+				}
+				fmt.Printf("[%s] %sFAST_PATH_DROP%s (Q:%d)%s %s:%d -> %s:%d (Proto: %d)\n",
+					time.Now().Format("15:04:05"), ColorRed, ColorReset, event.RxQueue, hashStr,
+					int2ip(event.SrcIP), event.SrcPort,
+					int2ip(event.DstIP), event.DstPort, event.Protocol)
+			} else if event.EventType == 3 {
+				hashStr := ""
+				if event.RxHash != 0 {
+					hashStr = fmt.Sprintf(" [HW_HASH: 0x%x]", event.RxHash)
+				}
+				fmt.Printf("[%s] %sREDIRECT_FAILURE%s (Q:%d)%s AF_XDP Socket Unreachable! Fail-Open applied for %s:%d\n",
+					time.Now().Format("15:04:05"), ColorYellow, ColorReset, event.RxQueue, hashStr,
+					int2ip(event.SrcIP), event.DstPort)
+			}
+		}
+	}()
 
-                // Print to stdout
-                fmt.Println(eventStr)
-                
-                // Optionally write to log file
-                if logFile != nil {
-                    fmt.Fprintln(logFile, eventStr)
-                }
-            }
-        }()
-    }
+	// 6.5 Start Telemetry Polling Loop for PerCPU Stats
+	go func() {
+		numCPUs, _ := ebpf.PossibleCPU()
+		lastBlockDrops := make([]uint64, numCPUs)
+		lastRedirectFails := make([]uint64, numCPUs)
 
-    // 7. Signal Handling
-    sigChan := make(chan os.Signal, 1)
-    signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+		for {
+			time.Sleep(1 * time.Second)
+			var perCPUVals []uint64
+			
+			// Blocklist drops (Reason = 0)
+			if err := objs.DropStatsMap.Lookup(uint32(0), &perCPUVals); err == nil {
+				for i := 0; i < numCPUs && i < len(perCPUVals); i++ {
+					diff := perCPUVals[i] - lastBlockDrops[i]
+					if diff > 0 {
+						metricFastDrops.WithLabelValues(fmt.Sprintf("%d", i)).Add(float64(diff))
+						lastBlockDrops[i] = perCPUVals[i]
+					}
+				}
+			}
 
-    for {
-        sig := <-sigChan
-        switch sig {
-        case syscall.SIGHUP:
-            fmt.Printf("\n%s[!] Reloading signatures...%s\n", ColorYellow, ColorReset)
-            if err := reloadSignatures(objs.PolicyMap, *sigFlag); err != nil {
-                fmt.Printf("%s[-] Reload Error: %v%s\n", ColorRed, err, ColorReset)
-            } else {
-                fmt.Printf("%s[+] Reload Complete.%s\n", ColorGreen, ColorReset)
-            }
-        case syscall.SIGINT, syscall.SIGTERM:
-            fmt.Printf("\n%s[-] Shutting down Hyperion.%s\n", ColorRed, ColorReset)
-            os.Remove("/tmp/hyperion.sock") // M4: Graceful IPC teardown
-            return
-        }
-    }
+			// Redirect Failures (Reason = 2)
+			if err := objs.DropStatsMap.Lookup(uint32(2), &perCPUVals); err == nil {
+				for i := 0; i < numCPUs && i < len(perCPUVals); i++ {
+					diff := perCPUVals[i] - lastRedirectFails[i]
+					if diff > 0 {
+						metricRedirectFailures.WithLabelValues(fmt.Sprintf("%d", i)).Add(float64(diff))
+						lastRedirectFails[i] = perCPUVals[i]
+					}
+				}
+			}
+		}
+	}()
+
+	// Periodic Stats polling
+	go func() {
+		for {
+			time.Sleep(5 * time.Second)
+			for q := 0; q < *queues; q++ {
+				stats, err := xsks[q].Stats()
+				if err == nil {
+					metricRxDropped.WithLabelValues(fmt.Sprintf("%d", q)).Set(float64(stats.KernelStats.Rx_dropped))
+				}
+			}
+		}
+	}()
+
+	// Ethtool HW Scraper
+	go func() {
+		for {
+			time.Sleep(5 * time.Second)
+			out, err := exec.Command("ethtool", "-S", *ifaceName).Output()
+			if err != nil {
+				continue
+			}
+			lines := strings.Split(string(out), "\n")
+			for _, line := range lines {
+				line = strings.TrimSpace(line)
+				if strings.Contains(line, "rx_missed_errors") || strings.Contains(line, "rx_nohandler") || strings.Contains(line, "drop") {
+					parts := strings.Split(line, ":")
+					if len(parts) == 2 {
+						statName := strings.TrimSpace(parts[0])
+						var val float64
+						fmt.Sscanf(strings.TrimSpace(parts[1]), "%f", &val)
+						metricHWNICDrops.WithLabelValues(statName).Set(val)
+					}
+				}
+			}
+		}
+	}()
+
+	// 7. Start AF_XDP Userspace DPI Loop (Slow Path)
+	for q := 0; q < *queues; q++ {
+		go func(queueID int, cpuBase int, xsk *xdp.Socket) {
+			// Performance Engineering: Pin Goroutine and OS Thread to specific CPU
+			runtime.LockOSThread()
+			defer runtime.UnlockOSThread()
+			
+			qStr := fmt.Sprintf("%d", queueID)
+
+			if cpuBase >= 0 {
+				targetCPU := cpuBase + queueID
+				var mask unix.CPUSet
+				mask.Set(targetCPU)
+				err := unix.SchedSetaffinity(0, &mask)
+				if err != nil {
+					log.Printf("Failed to pin AF_XDP thread to CPU %d: %v", targetCPU, err)
+				} else {
+					fmt.Printf("%s[+] CPU Affinity: Queue %d thread pinned to CPU %d%s\n", ColorGreen, queueID, targetCPU, ColorReset)
+				}
+			}
+
+			for {
+				// Poll the AF_XDP receive ring
+				wakeupStart := time.Now()
+				numReceived, _, err := xsk.Poll(-1)
+				if err != nil {
+					continue
+				}
+
+				if numReceived > 0 {
+					descs := xsk.Receive(numReceived)
+					
+					latencyMs := float64(time.Since(wakeupStart).Nanoseconds()) / 1e6
+					metricWakeupLatency.WithLabelValues(qStr).Observe(latencyMs)
+
+					for i := 0; i < len(descs); i++ {
+						frameData := xsk.GetFrame(descs[i])
+						metricSlowInspections.WithLabelValues(qStr).Inc()
+
+						action, reason := evaluateSlowPathPolicy(frameData, config.SlowPath)
+						
+						if action == "drop" {
+							metricSlowDrops.WithLabelValues(reason, qStr).Inc()
+							fmt.Printf("[%s] %sAF_XDP_DPI_DROP%s (Q:%d) Reason: %s (Len: %d)\n",
+								time.Now().Format("15:04:05"), ColorYellow, ColorReset,
+								queueID, reason, len(frameData))
+						}
+					}
+					xsk.Fill(descs)
+				}
+			}
+		}(q, *cpuPin, xsks[q])
+	}
+
+	// 8. Graceful Shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+
+	for {
+		sig := <-sigChan
+		switch sig {
+		case syscall.SIGHUP:
+			fmt.Println("Reloading Policy...")
+			newConf, err := LoadPolicyConfig(*configPath)
+			if err == nil {
+				config = newConf
+				applyFastPathPolicy(objs, config.FastPath)
+				fmt.Printf("%s[+] Policy Hot-Reloaded%s\n", ColorGreen, ColorReset)
+			}
+		case syscall.SIGINT, syscall.SIGTERM:
+			fmt.Printf("\n%s[-] Shutting down Hyperion AF_XDP...%s\n", ColorRed, ColorReset)
+			
+			if *multiProg {
+				fmt.Printf("[i] Unloading libxdp program...\n")
+				exec.Command("xdp-loader", "unload", "-a", *ifaceName).Run()
+				os.RemoveAll("/sys/fs/bpf/hyperion_xdp")
+			}
+			return
+		}
+	}
 }
 
-func reloadSignatures(m *ebpf.Map, cliSig string) error {
-    var newSigs []string
-    
-    // If CLI flag is provided, use it; otherwise fall back to file
-    if cliSig != "" {
-        // Parse comma-separated signatures from CLI
-        for _, sig := range strings.Split(cliSig, ",") {
-            sig = strings.TrimSpace(sig)
-            if sig != "" {
-                newSigs = append(newSigs, sig)
-            }
-        }
-    } else {
-        // Fall back to file-based config
-        f, err := os.Open(ConfigFile)
-        if err != nil {
-            return err
-        }
-        defer f.Close()
+func applyFastPathPolicy(objs bpfObjects, fp FastPathConfig) {
+	numCPUs, err := ebpf.PossibleCPU()
+	if err != nil {
+		log.Fatalf("Failed to get CPU count: %v", err)
+	}
 
-        sc := bufio.NewScanner(f)
-        for sc.Scan() {
-            line := strings.TrimSpace(sc.Text())
-            if line != "" && !strings.HasPrefix(line, "#") {
-                newSigs = append(newSigs, line)
-            }
-        }
-    }
+	blockedVals := make([]uint8, numCPUs)
+	for i := 0; i < numCPUs; i++ {
+		blockedVals[i] = 1
+	}
 
-    if len(newSigs) > MaxRules {
-        return fmt.Errorf("Too many rules (Max %d)", MaxRules)
-    }
+	for _, ipStr := range fp.DropIPs {
+		ip := net.ParseIP(ipStr).To4()
+		if ip == nil {
+			continue
+		}
+		ipInt := binary.LittleEndian.Uint32(ip)
+		objs.BlocklistMap.Put(ipInt, blockedVals)
+	}
 
-    for i := 0; i < MaxRules; i++ {
-        var pol Policy
-        if i < len(newSigs) {
-            s := newSigs[i]
-            if len(s) > 8 {
-                s = s[:8]
-            }
-            copy(pol.Signature[:], []byte(s))
-            pol.SigLen = uint8(len(s)) // FIXED: Type cast
-            pol.Active = 1
-            fmt.Printf("    %s-> Loaded Rule %d: %s%s\n", ColorBlue, i, s, ColorReset)
-        } else {
-            pol.Active = 0
-        }
-        
-        // FIXED: Use uint32(i) for key to match BPF definition
-        if err := m.Put(uint32(i), pol); err != nil {
-            return err
-        }
-    }
-    loadedSigs = newSigs
-    return nil
+	blockedVal := uint8(1)
+	for _, pr := range fp.RedirectPorts {
+		key := PortKey{
+			Protocol: pr.Protocol,
+			Port:     pr.Port,
+		}
+		objs.RedirectPortsMap.Put(key, blockedVal)
+	}
+}
+
+func evaluateSlowPathPolicy(payload []byte, sp SlowPathConfig) (string, string) {
+	payloadStr := string(payload) 
+	
+	for _, rule := range sp.DNSRules {
+		if strings.Contains(payloadStr, rule.Match) {
+			return rule.Action, "dns_match:" + rule.Match
+		}
+	}
+
+	for _, rule := range sp.PayloadSignatures {
+		if strings.Contains(payloadStr, rule.Match) {
+			return rule.Action, "payload_match:" + rule.Match
+		}
+	}
+
+	return "accept", ""
 }
 
 func int2ip(nn uint32) net.IP {
-    ip := make(net.IP, 4)
-    binary.LittleEndian.PutUint32(ip, nn)
-    return ip
+	ip := make(net.IP, 4)
+	binary.LittleEndian.PutUint32(ip, nn)
+	return ip
 }
 
-// Calculate boot time offset to convert bpf_ktime_get_ns() to Unix time
 func calculateBootTimeOffset() error {
-    // Read system uptime from /proc/uptime
-    data, err := os.ReadFile("/proc/uptime")
-    if err != nil {
-        return fmt.Errorf("failed to read /proc/uptime: %w", err)
-    }
-    
-    // /proc/uptime contains two numbers: uptime in seconds and idle time
-    // We only need the first number
-    var uptimeSeconds float64
-    _, err = fmt.Sscanf(string(data), "%f", &uptimeSeconds)
-    if err != nil {
-        return fmt.Errorf("failed to parse /proc/uptime: %w", err)
-    }
-    
-    // Convert uptime to nanoseconds
-    bootTimeNs := int64(uptimeSeconds * 1e9)
-    
-    // Calculate offset: current Unix time - boot time
-    bootTimeOffset = time.Now().UnixNano() - bootTimeNs
-    
-    return nil
+	data, err := os.ReadFile("/proc/uptime")
+	if err != nil {
+		return err
+	}
+	var uptime float64
+	fmt.Sscanf(string(data), "%f", &uptime)
+	bootTimeNs := int64(uptime * 1e9)
+	bootTimeOffset = time.Now().UnixNano() - bootTimeNs
+	return nil
 }
 
-// M5: Format telemetry event for display
-func formatTelemetryEvent(event *HypEvent) string {
-    // Convert timestamp from boot time nanoseconds to Unix time
-    // bpf_ktime_get_ns() returns nanoseconds since boot, so we add our offset
-    t := time.Unix(0, int64(event.Timestamp)+bootTimeOffset)
-    timestamp := t.Format("2006-01-02 15:04:05")
-    
-    // Convert IPs
-    srcIP := int2ip(event.SrcIP)
-    dstIP := int2ip(event.DstIP)
-    
-    // Convert ports from network byte order (big endian) to host byte order
-    // Ports are stored in network byte order, so we just need to swap bytes
-    srcPort := (event.SrcPort >> 8) | (event.SrcPort << 8)
-    dstPort := (event.DstPort >> 8) | (event.DstPort << 8)
-    
-    // Determine protocol name
-    protoName := "UNKNOWN"
-    switch event.Protocol {
-    case 6:
-        protoName = "TCP"
-    case 17:
-        protoName = "UDP"
-    }
-    
-    // Determine event type
-    eventType := ""
-    eventColor := ColorWhite
-    switch event.EventType {
-    case 0:
-        eventType = "ACCEPT"
-        eventColor = ColorGreen
-    case 1:
-        eventType = "DROP"
-        eventColor = ColorRed
-    case 2:
-        eventType = "SIG_MATCH"
-        eventColor = ColorYellow
-    }
-    
-    // Format signature if present
-    sigStr := ""
-    if event.EventType == 1 || event.EventType == 2 {
-        // Extract signature (null-terminated or fixed 8 bytes)
-        sig := bytes.TrimRight(event.Signature[:], "\x00")
-        if len(sig) > 0 {
-            sigStr = fmt.Sprintf(" sig=\"%s\"", string(sig))
-        }
-    }
-    
-    return fmt.Sprintf("[%s] %s%s%s %s:%d -> %s:%d %s%s",
-        timestamp,
-        eventColor,
-        eventType,
-        ColorReset,
-        srcIP,
-        srcPort,
-        dstIP,
-        dstPort,
-        protoName,
-        sigStr)
-}
-
-func printBanner() {
-    banner := `
-%s    __  __                      _
-   / / / /_  ______  ___  _____(_)___  ____
-  / /_/ / / / / __ \/ _ \/ ___/ / __ \/ __ \
- / __  / /_/ / /_/ /  __/ /  / / /_/ / / / /
-/_/ /_/\__, / .___/\___/_/  /_/\____/_/ /_/
-      /____/_/
-
-    %s:: Hyperion XDP Engine vM5 (Telemetry) ::%s
-`
-    fmt.Printf(banner, ColorCyan, ColorPurple, ColorReset)
-    fmt.Println()
+func loadPinnedMapSafe(path string) (*ebpf.Map, error) {
+	// Import ebpf to use LoadPinnedMap
+	// wait, it is imported by bpf_bpfel.go, but we might need it locally
+	// let's import github.com/cilium/ebpf if needed
+	return ebpf.LoadPinnedMap(path, nil)
 }

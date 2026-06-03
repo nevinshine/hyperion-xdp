@@ -1,0 +1,29 @@
+# Hyperion XDP Policy Configuration
+# Fast Path (Kernel) rules are loaded into BPF Maps
+# Slow Path (Userspace) rules are evaluated by Go AF_XDP engine
+
+fast_path:
+  # IP addresses to drop immediately in the XDP hook (O(1) lookup)
+  drop_ips:
+    - "198.51.100.42"
+    - "203.0.113.7"
+  
+  # Ports that should bypass XDP dropping and be redirected to AF_XDP for Deep Packet Inspection
+  # Protocol: 6 = TCP, 17 = UDP
+  redirect_ports:
+    - protocol: 17
+      port: 53  # Redirect DNS traffic to Userspace DPI
+    - protocol: 6
+      port: 80  # Redirect HTTP traffic to Userspace DPI
+
+slow_path:
+  # L7 / Deep Packet Inspection Signatures (Evaluated in Userspace AF_XDP)
+  dns_rules:
+    - match: "evil.com"
+      action: "drop"
+    - match: "malware.net"
+      action: "drop"
+  
+  payload_signatures:
+    - match: "GET /etc/passwd"
+      action: "drop"

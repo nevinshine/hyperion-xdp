@@ -4,7 +4,7 @@ BIN_DIR := bin
 BIN_NAME := hyperion_ctrl
 
 export BPF_CLANG := $(CLANG)
-export BPF_CFLAGS := -O2 -g -Wall -Werror -I/usr/include/x86_64-linux-gnu
+export BPF_CFLAGS := -O2 -g -Wall -Werror -Wno-missing-declarations -I/usr/include/x86_64-linux-gnu
 
 .PHONY: all clean build run
 

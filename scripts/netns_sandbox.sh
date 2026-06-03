@@ -1,50 +1,50 @@
-#!/usr/bin/env bash
+#!/bin/bash
+# Hyperion XDP Benchmark Sandbox
+# Sets up a veth pair to safely test XDP performance and AF_XDP queues
 
-# Robust local networking namespace setup script for Hyperion XDP
-set -euo pipefail
+set -e
 
-# Namespaces and interface definitions
-NS_ATTACKER="attacker"
-NS_VICTIM="victim"
-VETH_ATK="veth-atk"
-VETH_VIC="veth-vic"
+IF_ROOT="veth0"
+IF_NS="veth1"
+NS_NAME="hyp_test_ns"
+IP_ROOT="10.0.0.1"
+IP_NS="10.0.0.2"
 
-IP_ATTACKER="10.0.0.1/24"
-IP_VICTIM="10.0.0.2/24"
+if [ "$EUID" -ne 0 ]; then
+  echo "Please run as root"
+  exit 1
+fi
 
-# 1. Clean up old states
-echo "[*] Cleaning up old network namespaces and veth configurations..."
-ip netns del "$NS_ATTACKER" 2>/dev/null || true
-ip netns del "$NS_VICTIM" 2>/dev/null || true
-ip link del "$VETH_ATK" 2>/dev/null || true
+echo "[*] Cleaning up old namespace..."
+ip netns del $NS_NAME 2>/dev/null || true
+ip link del $IF_ROOT 2>/dev/null || true
 
-# 2. Build isolated network environments
-echo "[*] Constructing 'attacker' and 'victim' environments..."
-ip netns add "$NS_ATTACKER"
-ip netns add "$NS_VICTIM"
+echo "[*] Creating network namespace: $NS_NAME"
+ip netns add $NS_NAME
 
-# 3. Provision the virtual wire link
-echo "[*] Provisioning veth pair link: $VETH_ATK <-> $VETH_VIC"
-ip link add "$VETH_ATK" type veth peer name "$VETH_VIC"
+echo "[*] Creating veth pair ($IF_ROOT <--> $IF_NS)"
+ip link add $IF_ROOT type veth peer name $IF_NS
 
-# 4. Bind links to respective boundaries
-echo "[*] Allocating interfaces to namespaces..."
-ip link set "$VETH_ATK" netns "$NS_ATTACKER"
-ip link set "$VETH_VIC" netns "$NS_VICTIM"
+echo "[*] Moving $IF_NS to $NS_NAME"
+ip link set $IF_NS netns $NS_NAME
 
-# 5. Configure network interface layers
-echo "[*] Configuring IP layout and loopback links..."
-# Attacker configuration
-ip netns exec "$NS_ATTACKER" ip addr add "$IP_ATTACKER" dev "$VETH_ATK"
-ip netns exec "$NS_ATTACKER" ip link set "$VETH_ATK" up
-ip netns exec "$NS_ATTACKER" ip link set lo up
+echo "[*] Configuring IPs"
+ip addr add $IP_ROOT/24 dev $IF_ROOT
+ip link set $IF_ROOT up
 
-# Victim configuration
-ip netns exec "$NS_VICTIM" ip addr add "$IP_VICTIM" dev "$VETH_VIC"
-ip netns exec "$NS_VICTIM" ip link set "$VETH_VIC" up
-ip netns exec "$NS_VICTIM" ip link set lo up
+ip netns exec $NS_NAME ip addr add $IP_NS/24 dev $IF_NS
+ip netns exec $NS_NAME ip link set $IF_NS up
 
-echo "[+] Success. Environment is staged."
-echo " -> Attacker Namespace IP: 10.0.0.1 ($VETH_ATK)"
-echo " -> Victim Namespace IP:   10.0.0.2 ($VETH_VIC)"
-echo "[*] Ready to attach Hyperion XDP to target interface: $VETH_VIC"
+# To allow traffic to flow, routing must be enabled
+ip netns exec $NS_NAME ip route add default via $IP_ROOT
+
+# Disable offloads on the veth interfaces to ensure XDP handles raw frames properly
+ethtool -K $IF_ROOT tx off rx off tso off gso off gro off || true
+ip netns exec $NS_NAME ethtool -K $IF_NS tx off rx off tso off gso off gro off || true
+
+echo "[+] Sandbox Ready!"
+echo "    Root IF: $IF_ROOT ($IP_ROOT)"
+echo "    Test NS: $IF_NS ($IP_NS)"
+echo ""
+echo "To attach Hyperion: sudo ./bin/hyperion_ctrl -iface $IF_ROOT"
+echo "To generate traffic: sudo ip netns exec $NS_NAME iperf3 -c $IP_ROOT -u -b 10G"

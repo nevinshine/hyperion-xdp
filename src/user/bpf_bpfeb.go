@@ -13,35 +13,11 @@ import (
 	"github.com/cilium/ebpf"
 )
 
-type bpfDnsNameKey struct {
-	_    structs.HostLayout
-	Name [64]uint8
-}
-
-type bpfFlowKey struct {
+type bpfPortKey struct {
 	_        structs.HostLayout
-	SrcIp    uint32
-	DstIp    uint32
-	SrcPort  uint16
-	DstPort  uint16
 	Protocol uint8
-	_        [3]byte
-}
-
-type bpfFlowValue struct {
-	_         structs.HostLayout
-	Packets   uint64
-	Bytes     uint64
-	FirstSeen uint64
-	LastSeen  uint64
-}
-
-type bpfPolicyT struct {
-	_         structs.HostLayout
-	Signature [8]uint8
-	SigLen    uint8
-	Active    uint8
-	Pad       [2]uint8
+	Pad      uint8
+	Port     uint16
 }
 
 // loadBpf returns the embedded CollectionSpec for bpf.
@@ -93,12 +69,11 @@ type bpfProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type bpfMapSpecs struct {
-	AlertRingbuf     *ebpf.MapSpec `ebpf:"alert_ringbuf"`
 	BlocklistMap     *ebpf.MapSpec `ebpf:"blocklist_map"`
-	DnsBlocklistMap  *ebpf.MapSpec `ebpf:"dns_blocklist_map"`
-	FlowMap          *ebpf.MapSpec `ebpf:"flow_map"`
-	PolicyMap        *ebpf.MapSpec `ebpf:"policy_map"`
+	DropStatsMap     *ebpf.MapSpec `ebpf:"drop_stats_map"`
+	RedirectPortsMap *ebpf.MapSpec `ebpf:"redirect_ports_map"`
 	TelemetryRingbuf *ebpf.MapSpec `ebpf:"telemetry_ringbuf"`
+	XskMap           *ebpf.MapSpec `ebpf:"xsk_map"`
 }
 
 // bpfVariableSpecs contains global variables before they are loaded into the kernel.
@@ -127,22 +102,20 @@ func (o *bpfObjects) Close() error {
 //
 // It can be passed to loadBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type bpfMaps struct {
-	AlertRingbuf     *ebpf.Map `ebpf:"alert_ringbuf"`
 	BlocklistMap     *ebpf.Map `ebpf:"blocklist_map"`
-	DnsBlocklistMap  *ebpf.Map `ebpf:"dns_blocklist_map"`
-	FlowMap          *ebpf.Map `ebpf:"flow_map"`
-	PolicyMap        *ebpf.Map `ebpf:"policy_map"`
+	DropStatsMap     *ebpf.Map `ebpf:"drop_stats_map"`
+	RedirectPortsMap *ebpf.Map `ebpf:"redirect_ports_map"`
 	TelemetryRingbuf *ebpf.Map `ebpf:"telemetry_ringbuf"`
+	XskMap           *ebpf.Map `ebpf:"xsk_map"`
 }
 
 func (m *bpfMaps) Close() error {
 	return _BpfClose(
-		m.AlertRingbuf,
 		m.BlocklistMap,
-		m.DnsBlocklistMap,
-		m.FlowMap,
-		m.PolicyMap,
+		m.DropStatsMap,
+		m.RedirectPortsMap,
 		m.TelemetryRingbuf,
+		m.XskMap,
 	)
 }
 

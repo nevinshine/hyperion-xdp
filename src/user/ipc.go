@@ -24,7 +24,7 @@ type IpcResponse struct {
 }
 
 // StartIPCServer starts the Unix Domain Socket listener for Cortex bridge commands.
-func StartIPCServer(policyMap *ebpf.Map, blocklistMap *ebpf.Map) {
+func StartIPCServer(blocklistMap *ebpf.Map) {
 	// Clean up old socket if it exists
 	os.Remove(IpcSocketPath)
 
@@ -47,11 +47,11 @@ func StartIPCServer(policyMap *ebpf.Map, blocklistMap *ebpf.Map) {
 			log.Printf("IPC accept error: %v", err)
 			continue
 		}
-		go handleIPCConnection(conn, policyMap, blocklistMap)
+		go handleIPCConnection(conn, blocklistMap)
 	}
 }
 
-func handleIPCConnection(conn net.Conn, policyMap *ebpf.Map, blocklistMap *ebpf.Map) {
+func handleIPCConnection(conn net.Conn, blocklistMap *ebpf.Map) {
 	defer conn.Close()
 
 	var req IpcRequest
@@ -63,35 +63,12 @@ func handleIPCConnection(conn net.Conn, policyMap *ebpf.Map, blocklistMap *ebpf.
 
 	switch req.Command {
 	case "add_signature":
-		handleAddSignature(req.Payload, policyMap, conn)
+		sendIpcResponse(conn, false, "Signatures are managed via policy.yaml now")
 	case "block_ip":
 		handleBlockIP(req.Payload, blocklistMap, conn)
 	default:
 		sendIpcResponse(conn, false, "Unknown command")
 	}
-}
-
-func handleAddSignature(payload string, policyMap *ebpf.Map, conn net.Conn) {
-	// Find the first empty slot or just override max. Wait, policyMap max entries is 2!
-	// We'll just overwrite slot 0 for simplicity if we must, or ideally scan for inactive.
-	// Since this is a prototype, let's just write to slot 1 (since index 0 might be used by signatures.txt).
-	var pol Policy
-	sigBytes := []byte(payload)
-	if len(sigBytes) > 8 {
-		sigBytes = sigBytes[:8]
-	}
-	copy(pol.Signature[:], sigBytes)
-	pol.SigLen = uint8(len(sigBytes))
-	pol.Active = 1
-	
-	// Write to slot 1
-	if err := policyMap.Put(uint32(1), pol); err != nil {
-		sendIpcResponse(conn, false, fmt.Sprintf("Failed to update map: %v", err))
-		return
-	}
-	
-	fmt.Printf("%s[IPC] Added payload signature: %s%s\n", ColorYellow, payload, ColorReset)
-	sendIpcResponse(conn, true, "Signature added successfully")
 }
 
 func handleBlockIP(ipStr string, blocklistMap *ebpf.Map, conn net.Conn) {
@@ -110,8 +87,18 @@ func handleBlockIP(ipStr string, blocklistMap *ebpf.Map, conn net.Conn) {
 	// Parse to uint32 using LittleEndian so it matches the network byte order struct layout exactly
 	ipUint := binary.LittleEndian.Uint32(ip4)
 	
-	flag := uint8(1) // Just a dummy value indicating it is blocked
-	if err := blocklistMap.Put(&ipUint, &flag); err != nil {
+	numCPUs, err := ebpf.PossibleCPU()
+	if err != nil {
+		sendIpcResponse(conn, false, "Failed to get possible CPUs")
+		return
+	}
+
+	flags := make([]uint8, numCPUs)
+	for i := 0; i < numCPUs; i++ {
+		flags[i] = 1
+	}
+
+	if err := blocklistMap.Put(&ipUint, &flags); err != nil {
 		sendIpcResponse(conn, false, fmt.Sprintf("Failed to add to blocklist: %v", err))
 		return
 	}
