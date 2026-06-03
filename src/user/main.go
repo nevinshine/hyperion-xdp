@@ -12,7 +12,9 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"runtime"
@@ -97,9 +99,72 @@ var (
 		Name: "hyperion_hw_nic_drops_total",
 		Help: "Hardware-level NIC drops scraped via ethtool",
 	}, []string{"stat"})
+	metricWatchdogDegraded = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "hyperion_watchdog_degraded_total",
+		Help: "Number of times the dataplane entered starvation/congestion mode (Fail-Open)",
+	})
+	metricWatchdogState = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "hyperion_watchdog_state",
+		Help: "Current state of the dataplane watchdog (0 = Healthy, 1 = Degraded, 2 = Recovering)",
+	})
+	metricWatchdogRecovery = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "hyperion_watchdog_recovery_total",
+		Help: "Number of times the dataplane successfully recovered from starvation back to healthy",
+	})
+	metricWatchdogDegradedSeconds = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "hyperion_watchdog_degraded_seconds",
+		Help:    "Duration spent actively degraded due to congestion backpressure",
+		Buckets: []float64{0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 60.0},
+	})
+	metricWatchdogRecoveringSeconds = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "hyperion_watchdog_recovering_seconds",
+		Help:    "Duration spent in hysteresis recovery window before promoting to healthy",
+		Buckets: []float64{0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 60.0},
+	})
+	metricRingOccupancy = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "hyperion_ring_occupancy",
+		Help: "Current number of active AF_XDP descriptors checked out to userspace",
+	})
 )
 
+// WatchdogState represents the formal operational state of the dataplane watchdog.
+// State transitions follow a strict order: HEALTHY → DEGRADED → RECOVERING → HEALTHY.
+// The kernel fast-path is stateless; these states exist only in userspace for
+// telemetry, hysteresis, and operational auditing.
+type WatchdogState int
+
+const (
+	// WatchdogHealthy: AF_XDP socket is responsive, heartbeat is fresh.
+	// Kernel fast-path redirects packets to userspace for deep inspection.
+	WatchdogHealthy WatchdogState = 0
+
+	// WatchdogDegraded: AF_XDP backpressure detected or userspace stalled.
+	// Heartbeat is deliberately starved, causing the kernel to fail-open via XDP_PASS.
+	// Deep inspection is suspended; forwarding continuity is prioritized.
+	WatchdogDegraded WatchdogState = 1
+
+	// WatchdogRecovering: Backpressure has subsided but hysteresis window is active.
+	// System waits for 5 consecutive healthy ticks (50ms) before promoting to HEALTHY,
+	// preventing rapid oscillation between DEGRADED and HEALTHY.
+	WatchdogRecovering WatchdogState = 2
+)
+
+// String returns the formal name of the watchdog state.
+func (s WatchdogState) String() string {
+	switch s {
+	case WatchdogHealthy:
+		return "HEALTHY"
+	case WatchdogDegraded:
+		return "DEGRADED"
+	case WatchdogRecovering:
+		return "RECOVERING"
+	default:
+		return "UNKNOWN"
+	}
+}
+
 var bootTimeOffset int64
+var activeDescriptors int32
 
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc $BPF_CLANG -cflags $BPF_CFLAGS bpf ../kern/hyperion_core.c -- -I../common
 
@@ -109,6 +174,8 @@ func main() {
 	cpuPin := flag.Int("cpu", -1, "CPU Core ID to pin the AF_XDP polling thread (-1 to disable)")
 	multiProg := flag.Bool("multiprog", false, "Use libxdp multiprog dispatcher (requires xdp-tools)")
 	queues := flag.Int("queues", 1, "Number of RX queues to bind AF_XDP sockets to")
+	hwMetadata := flag.Bool("hw-metadata", false, "Enable hardware metadata acceleration (RSS hashes, HW timestamps). Requires supported physical NIC.")
+	forceGeneric := flag.Bool("force-generic", false, "Force XDP Generic Mode (SKB Mode) attachment instead of Native Mode")
 	flag.Parse()
 
 	fmt.Printf("%s:: Hyperion AF_XDP Dataplane Engine ::%s\n\n", ColorCyan, ColorReset)
@@ -173,21 +240,80 @@ func main() {
 		if objs.XskMap, mapErr = loadPinnedMapSafe(pinPath + "/xsk_map"); mapErr != nil {
 			log.Fatalf("Map load err: %v", mapErr)
 		}
-		defer objs.Close()
-	} else {
-		if err := loadBpfObjects(&objs, nil); err != nil {
-			log.Fatalf("Load BPF failed: %v", err)
+		if objs.WatchdogMap, mapErr = loadPinnedMapSafe(pinPath + "/watchdog_map"); mapErr != nil {
+			log.Fatalf("Map load err: %v", mapErr)
 		}
 		defer objs.Close()
+	} else {
+		spec, err := loadBpf()
+		if err != nil {
+			log.Fatalf("Failed to load BPF spec: %v", err)
+		}
+
+		// Rewrite cfg_num_queues so the BPF program uses rx_queue_index for multi-queue
+		// NICs, or forces queue 0 for single-queue/virtual interfaces.
+		if err := spec.RewriteConstants(map[string]interface{}{
+			"cfg_num_queues": uint32(*queues),
+		}); err != nil {
+			log.Fatalf("Failed to rewrite cfg_num_queues: %v", err)
+		}
+		if *queues > 1 {
+			fmt.Printf("%s[+] Multi-Queue RSS: %d queues (using rx_queue_index)%s\n", ColorCyan, *queues, ColorReset)
+		}
+
+		var activeProgram *ebpf.Program
+		var coll *ebpf.Collection
+
+		if *hwMetadata {
+			// Attempt 1: Hardware Metadata Program
+			specHw := spec.Copy()
+			delete(specHw.Programs, "hyperion_filter_generic")
+			coll, err = ebpf.NewCollectionWithOptions(specHw, ebpf.CollectionOptions{})
+			if err == nil {
+				fmt.Printf("%s[+] Hardware Metadata Acceleration: ENABLED (Physical NIC Detected)%s\n", ColorCyan, ColorReset)
+				activeProgram = coll.Programs["hyperion_filter_hw"]
+			} else {
+				fmt.Printf("%s[!] Hardware Metadata rejected by kernel, falling back to Generic XDP.%s\n", ColorYellow, ColorReset)
+			}
+		} else {
+			fmt.Printf("%s[+] Hardware Metadata Acceleration: DISABLED by user (Skipping Probe)%s\n", ColorYellow, ColorReset)
+		}
+
+		if activeProgram == nil {
+			// Fallback: Generic Program
+			specGeneric := spec.Copy()
+			delete(specGeneric.Programs, "hyperion_filter_hw")
+			coll, err = ebpf.NewCollectionWithOptions(specGeneric, ebpf.CollectionOptions{})
+			if err != nil {
+				log.Fatalf("Load BPF Generic fallback failed: %v", err)
+			}
+			activeProgram = coll.Programs["hyperion_filter_generic"]
+		}
+		defer coll.Close()
+		
+		// Map back to objs so the rest of the code functions normally
+		objs.BlocklistMap = coll.Maps["blocklist_map"]
+		objs.RedirectPortsMap = coll.Maps["redirect_ports_map"]
+		objs.TelemetryRingbuf = coll.Maps["telemetry_ringbuf"]
+		objs.DropStatsMap = coll.Maps["drop_stats_map"]
+		objs.XskMap = coll.Maps["xsk_map"]
+		objs.WatchdogMap = coll.Maps["watchdog_map"]
 		
 		iface, err := net.InterfaceByName(*ifaceName)
 		if err != nil {
 			log.Fatalf("Interface %s not found", *ifaceName)
 		}
 
+		var attachFlags link.XDPAttachFlags = 0
+		if *forceGeneric {
+			attachFlags = link.XDPGenericMode
+			fmt.Printf("%s[i] Forcing XDP Generic Mode (SKB) attachment%s\n", ColorYellow, ColorReset)
+		}
+
 		attachedLink, err = link.AttachXDP(link.XDPOptions{
-			Program:   objs.HyperionFilter,
+			Program:   activeProgram,
 			Interface: iface.Index,
+			Flags:     attachFlags,
 		})
 		if err != nil {
 			log.Fatalf("XDP Attach failed: %v", err)
@@ -210,18 +336,37 @@ func main() {
 
 	var xsks []*xdp.Socket
 	for q := 0; q < *queues; q++ {
+		// Attempt 1: Zero-Copy
+		xdp.DefaultSocketFlags = unix.XDP_ZEROCOPY
 		xsk, err := xdp.NewSocket(iface.Index, q, nil)
-		if err != nil {
-			log.Fatalf("Failed to create AF_XDP socket for queue %d: %v", q, err)
+		if err == nil {
+			fmt.Printf("%s[+] Zero-Copy AF_XDP Acceleration: ENABLED (Queue %d)%s\n", ColorCyan, q, ColorReset)
+		} else {
+			// Fallback: Copy-Mode
+			fmt.Printf("%s[!] Zero-Copy unsupported, falling back to SKB Copy-Mode (Queue %d)%s\n", ColorYellow, q, ColorReset)
+			xdp.DefaultSocketFlags = unix.XDP_COPY
+			xsk, err = xdp.NewSocket(iface.Index, q, nil)
+			if err != nil {
+				log.Fatalf("Failed to create AF_XDP socket (even in Copy-Mode) for queue %d: %v", q, err)
+			}
 		}
+
 		xsks = append(xsks, xsk)
 		defer xsk.Close()
+
+		// Prime the pump: Give the kernel all available empty descriptors so it can receive packets
+		descs := xsk.GetDescs(xsk.NumFreeFillSlots())
+		n := xsk.Fill(descs)
+		fmt.Printf("[+] AF_XDP Fill Ring primed with %d/%d descriptors (NumFreeFillSlots=%d)\n", n, len(descs), xsk.NumFreeFillSlots())
 
 		if err := objs.XskMap.Put(uint32(q), uint32(xsk.FD())); err != nil {
 			log.Fatalf("Failed to insert AF_XDP socket into BPF map: %v", err)
 		}
 		fmt.Printf("%s[+] Slow Path AF_XDP socket bound to queue %d%s\n", ColorGreen, q, ColorReset)
 	}
+
+	// Launch Backpressure-Driven Watchdog
+	go watchdogLoop(&objs, xsks)
 
 	// 5. Start Prometheus endpoint
 	go func() {
@@ -352,6 +497,7 @@ func main() {
 			defer runtime.UnlockOSThread()
 			
 			qStr := fmt.Sprintf("%d", queueID)
+			simulateLag := os.Getenv("HYPERION_SIMULATE_LAG") != ""
 
 			if cpuBase >= 0 {
 				targetCPU := cpuBase + queueID
@@ -375,6 +521,7 @@ func main() {
 
 				if numReceived > 0 {
 					descs := xsk.Receive(numReceived)
+					atomic.AddInt32(&activeDescriptors, int32(numReceived))
 					
 					latencyMs := float64(time.Since(wakeupStart).Nanoseconds()) / 1e6
 					metricWakeupLatency.WithLabelValues(qStr).Observe(latencyMs)
@@ -392,7 +539,13 @@ func main() {
 								queueID, reason, len(frameData))
 						}
 					}
+					
+					if simulateLag {
+						time.Sleep(20 * time.Millisecond) // Artificially cripple processing speed to simulate severe GC/Load
+					}
+
 					xsk.Fill(descs)
+					atomic.AddInt32(&activeDescriptors, -int32(numReceived))
 				}
 			}
 		}(q, *cpuPin, xsks[q])
@@ -449,10 +602,12 @@ func applyFastPathPolicy(objs bpfObjects, fp FastPathConfig) {
 	blockedVal := uint8(1)
 	for _, pr := range fp.RedirectPorts {
 		key := PortKey{
-			Protocol: pr.Protocol,
-			Port:     pr.Port,
+			Protocol: uint8(pr.Protocol),
+			Port:     uint16(pr.Port),
 		}
-		objs.RedirectPortsMap.Put(key, blockedVal)
+		if err := objs.RedirectPortsMap.Put(key, blockedVal); err != nil {
+			log.Printf("[!] Failed to insert redirect port %d/%d: %v", pr.Protocol, pr.Port, err)
+		}
 	}
 }
 
@@ -497,4 +652,112 @@ func loadPinnedMapSafe(path string) (*ebpf.Map, error) {
 	// wait, it is imported by bpf_bpfel.go, but we might need it locally
 	// let's import github.com/cilium/ebpf if needed
 	return ebpf.LoadPinnedMap(path, nil)
+}
+
+func watchdogLoop(objs *bpfObjects, xsks []*xdp.Socket) {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	
+	key := uint32(0)
+	state := WatchdogHealthy
+	consecutiveHealthy := 0
+	stateEnteredAt := time.Now()
+
+	threshold := 1024 // default 50% capacity
+	if val := os.Getenv("HYPERION_CONGESTION_THRESHOLD"); val != "" {
+		if t, err := strconv.Atoi(val); err == nil {
+			threshold = t
+		}
+	}
+
+	type TransitionReason string
+	const (
+		ReasonBackpressure         TransitionReason = "af_xdp_backpressure"
+		ReasonBackpressureSubsided TransitionReason = "backpressure_subsided"
+		ReasonHysteresisComplete   TransitionReason = "hysteresis_complete"
+	)
+
+	allowedTransitions := map[WatchdogState]map[WatchdogState]bool{
+		WatchdogHealthy:    {WatchdogDegraded: true},
+		WatchdogDegraded:   {WatchdogRecovering: true},
+		WatchdogRecovering: {WatchdogHealthy: true, WatchdogDegraded: true},
+	}
+
+	// transitionTo records a formal state transition with audit telemetry.
+	transitionTo := func(newState WatchdogState, reason TransitionReason, details string) {
+		if state == newState {
+			return
+		}
+		
+		// Formal FSM Validation
+		if allowed, ok := allowedTransitions[state][newState]; !ok || !allowed {
+			log.Fatalf("[FATAL] Illegal FSM Transition Attempted: %s → %s (reason: %s)", state, newState, reason)
+		}
+
+		now := time.Now()
+		durationInState := now.Sub(stateEnteredAt)
+		
+		// Split Histograms
+		if state == WatchdogDegraded {
+			metricWatchdogDegradedSeconds.Observe(durationInState.Seconds())
+		} else if state == WatchdogRecovering {
+			metricWatchdogRecoveringSeconds.Observe(durationInState.Seconds())
+		}
+		
+		oldState := state
+		state = newState
+		stateEnteredAt = now
+		metricWatchdogState.Set(float64(newState))
+		
+		if details != "" {
+			log.Printf("[WATCHDOG] %s → %s | reason=%s | details=%s | duration=%.3fs", oldState, newState, reason, details, durationInState.Seconds())
+		} else {
+			log.Printf("[WATCHDOG] %s → %s | reason=%s | duration=%.3fs", oldState, newState, reason, durationInState.Seconds())
+		}
+	}
+
+	for range ticker.C {
+		congested := false
+		
+		// Update Ring Occupancy Gauge
+		currentOccupancy := atomic.LoadInt32(&activeDescriptors)
+		metricRingOccupancy.Set(float64(currentOccupancy))
+		
+		// mathematically correct backpressure: how many packets are checked out and stalling?
+		if currentOccupancy > int32(threshold) {
+			congested = true
+		}
+		
+		if congested {
+			if state == WatchdogHealthy || state == WatchdogRecovering {
+				transitionTo(WatchdogDegraded, ReasonBackpressure, "")
+			}
+			consecutiveHealthy = 0
+			metricWatchdogDegraded.Inc()
+			continue // Deliberately starve the watchdog
+		}
+		
+		if state == WatchdogDegraded {
+			transitionTo(WatchdogRecovering, ReasonBackpressureSubsided, "")
+		}
+		
+		if state == WatchdogRecovering {
+			consecutiveHealthy++
+			if consecutiveHealthy < 5 { // 50ms hysteresis
+				continue // Starve heartbeat to prevent oscillation
+			}
+			// Fully recovered
+			consecutiveHealthy = 0
+			metricWatchdogRecovery.Inc()
+			transitionTo(WatchdogHealthy, ReasonHysteresisComplete, "")
+		}
+		
+		// eBPF uses bpf_ktime_get_ns() (uptime in nanoseconds)
+		ktime := uint64(time.Now().UnixNano() - bootTimeOffset)
+		
+		err := objs.WatchdogMap.Put(key, ktime)
+		if err != nil {
+			log.Printf("Watchdog update failed: %v", err)
+		}
+	}
 }

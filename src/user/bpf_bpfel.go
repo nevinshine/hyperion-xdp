@@ -62,7 +62,8 @@ type bpfSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type bpfProgramSpecs struct {
-	HyperionFilter *ebpf.ProgramSpec `ebpf:"hyperion_filter"`
+	HyperionFilterGeneric *ebpf.ProgramSpec `ebpf:"hyperion_filter_generic"`
+	HyperionFilterHw      *ebpf.ProgramSpec `ebpf:"hyperion_filter_hw"`
 }
 
 // bpfMapSpecs contains maps before they are loaded into the kernel.
@@ -73,6 +74,7 @@ type bpfMapSpecs struct {
 	DropStatsMap     *ebpf.MapSpec `ebpf:"drop_stats_map"`
 	RedirectPortsMap *ebpf.MapSpec `ebpf:"redirect_ports_map"`
 	TelemetryRingbuf *ebpf.MapSpec `ebpf:"telemetry_ringbuf"`
+	WatchdogMap      *ebpf.MapSpec `ebpf:"watchdog_map"`
 	XskMap           *ebpf.MapSpec `ebpf:"xsk_map"`
 }
 
@@ -80,6 +82,7 @@ type bpfMapSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type bpfVariableSpecs struct {
+	CfgNumQueues *ebpf.VariableSpec `ebpf:"cfg_num_queues"`
 }
 
 // bpfObjects contains all objects after they have been loaded into the kernel.
@@ -106,6 +109,7 @@ type bpfMaps struct {
 	DropStatsMap     *ebpf.Map `ebpf:"drop_stats_map"`
 	RedirectPortsMap *ebpf.Map `ebpf:"redirect_ports_map"`
 	TelemetryRingbuf *ebpf.Map `ebpf:"telemetry_ringbuf"`
+	WatchdogMap      *ebpf.Map `ebpf:"watchdog_map"`
 	XskMap           *ebpf.Map `ebpf:"xsk_map"`
 }
 
@@ -115,6 +119,7 @@ func (m *bpfMaps) Close() error {
 		m.DropStatsMap,
 		m.RedirectPortsMap,
 		m.TelemetryRingbuf,
+		m.WatchdogMap,
 		m.XskMap,
 	)
 }
@@ -123,18 +128,21 @@ func (m *bpfMaps) Close() error {
 //
 // It can be passed to loadBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type bpfVariables struct {
+	CfgNumQueues *ebpf.Variable `ebpf:"cfg_num_queues"`
 }
 
 // bpfPrograms contains all programs after they have been loaded into the kernel.
 //
 // It can be passed to loadBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type bpfPrograms struct {
-	HyperionFilter *ebpf.Program `ebpf:"hyperion_filter"`
+	HyperionFilterGeneric *ebpf.Program `ebpf:"hyperion_filter_generic"`
+	HyperionFilterHw      *ebpf.Program `ebpf:"hyperion_filter_hw"`
 }
 
 func (p *bpfPrograms) Close() error {
 	return _BpfClose(
-		p.HyperionFilter,
+		p.HyperionFilterGeneric,
+		p.HyperionFilterHw,
 	)
 }
 

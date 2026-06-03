@@ -14,6 +14,9 @@
 #define IPPROTO_UDP 17
 #endif
 
+// Dynamic Capability Probing
+// FIX: We now export two separate programs and dynamically patch the ELF CollectionSpec in Go
+// to bypass early BTF resolution for kfuncs.
 // -----------------------------------------------------------------------------
 // HYPERION FAST PATH (KERNEL XDP)
 // - Bounded Checks
@@ -34,8 +37,25 @@ struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __type(key, __u32);
     __type(value, __u64);
-    __uint(max_entries, 4); // 0=Blocklist, 1=Malformed, 2=Redirect_Failure
+    __uint(max_entries, 5); // 0=Blocklist, 1=Malformed, 2=Redirect_Failure, 3=Watchdog_Degraded, 4=Redirect_Match
 } drop_stats_map SEC(".maps");
+
+// Watchdog Map: Userspace heartbeat timestamp
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __type(key, __u32);
+    __type(value, __u64);
+    __uint(max_entries, 1);
+} watchdog_map SEC(".maps");
+
+// 50ms stall threshold before degrading to XDP_PASS
+#define STALL_THRESHOLD_NS 50000000ULL
+
+// Runtime-rewritten constant: number of AF_XDP queues bound by userspace.
+// When cfg_num_queues == 1, we force queue 0 (safe for loopback/veth where
+// rx_queue_index erroneously reports the CPU ID in Generic XDP mode).
+// When cfg_num_queues > 1, we use ctx->rx_queue_index for proper RSS fan-out.
+volatile const __u32 cfg_num_queues = 1;
 
 struct port_key {
     __u8 protocol;
@@ -91,7 +111,7 @@ static __attribute__((always_inline)) void increment_drop_stat(__u32 reason) {
     }
 }
 
-static __attribute__((noinline)) void emit_drop_telemetry(struct xdp_md *ctx, __u32 sip, __u32 dip, __u16 sport, __u16 dport, __u8 proto) {
+static __attribute__((always_inline)) void emit_drop_telemetry(struct xdp_md *ctx, __u32 sip, __u32 dip, __u16 sport, __u16 dport, __u8 proto, bool hw_metadata) {
     struct hyp_event *evt = bpf_ringbuf_reserve(&telemetry_ringbuf, sizeof(*evt), 0);
     if (!evt) return;
     evt->event_type = 1; // DROP
@@ -103,14 +123,18 @@ static __attribute__((noinline)) void emit_drop_telemetry(struct xdp_md *ctx, __
     evt->protocol = proto;
     
     evt->rx_hash = 0;
-    if (bpf_xdp_metadata_rx_hash) {
-        __u32 type = 0;
-        bpf_xdp_metadata_rx_hash(ctx, &evt->rx_hash, (void *)&type);
+    if (hw_metadata) {
+        if (bpf_xdp_metadata_rx_hash) {
+            __u32 type = 0;
+            bpf_xdp_metadata_rx_hash(ctx, &evt->rx_hash, (void *)&type);
+        }
     }
 
     evt->timestamp = 0;
-    if (bpf_xdp_metadata_rx_timestamp) {
-        bpf_xdp_metadata_rx_timestamp(ctx, &evt->timestamp);
+    if (hw_metadata) {
+        if (bpf_xdp_metadata_rx_timestamp) {
+            bpf_xdp_metadata_rx_timestamp(ctx, &evt->timestamp);
+        }
     }
     if (evt->timestamp == 0) {
         evt->timestamp = bpf_ktime_get_ns();
@@ -119,8 +143,7 @@ static __attribute__((noinline)) void emit_drop_telemetry(struct xdp_md *ctx, __
     bpf_ringbuf_submit(evt, 0);
 }
 
-SEC("xdp")
-int hyperion_filter(struct xdp_md *ctx) {
+static __attribute__((always_inline)) int hyperion_filter_main(struct xdp_md *ctx, bool hw_metadata) {
     struct cursor c;
     c.pos = (void *)(long)ctx->data;
     c.end = (void *)(long)ctx->data_end;
@@ -148,7 +171,7 @@ int hyperion_filter(struct xdp_md *ctx) {
     __u8 *is_blocked = bpf_map_lookup_elem(&blocklist_map, &src_ip);
     if (is_blocked && *is_blocked == 1) {
         increment_drop_stat(0); // 0 = Blocklist Drop
-        emit_drop_telemetry(ctx, src_ip, dst_ip, 0, 0, protocol);
+        emit_drop_telemetry(ctx, src_ip, dst_ip, 0, 0, protocol, hw_metadata);
         return XDP_DROP;
     }
 
@@ -177,8 +200,25 @@ int hyperion_filter(struct xdp_md *ctx) {
 
     __u8 *should_redirect = bpf_map_lookup_elem(&redirect_ports_map, &pkey);
     if (should_redirect && *should_redirect == 1) {
+        increment_drop_stat(4); // 4 = Redirect Match (Diagnostic)
+        
+        // Synchronous Watchdog Check
+        __u32 wd_key = 0;
+        __u64 *last_hb = bpf_map_lookup_elem(&watchdog_map, &wd_key);
+        __u64 now = bpf_ktime_get_ns();
+        if (last_hb && (now - *last_hb) > STALL_THRESHOLD_NS) {
+            increment_drop_stat(3); // 3 = Watchdog Degradation (not actually dropped, but logged as fallback)
+            // Note: In production we'd emit a dedicated WATCHDOG_DEGRADED telemetry event.
+            // For now, we instantly fail-open to preserve O(1) forwarding.
+            return XDP_PASS;
+        }
+
         // Check if AF_XDP socket is actually bound to this queue
-        __u32 *xsk = bpf_map_lookup_elem(&xsk_map, &ctx->rx_queue_index);
+        // When single-queue (loopback/veth), force queue 0 since Generic XDP
+        // populates rx_queue_index with the CPU ID, not the hardware queue.
+        // When multi-queue (real NIC), use rx_queue_index for RSS fan-out.
+        __u32 q_idx = (cfg_num_queues > 1) ? ctx->rx_queue_index : 0;
+        __u32 *xsk = bpf_map_lookup_elem(&xsk_map, &q_idx);
         if (!xsk) {
             increment_drop_stat(2); // 2 = Redirect Failure
             // Fail-Open: Socket is dead or unbound. Emit telemetry and XDP_PASS.
@@ -193,14 +233,19 @@ int hyperion_filter(struct xdp_md *ctx) {
                 evt->protocol = protocol;
                 
                 evt->rx_hash = 0;
-                if (bpf_xdp_metadata_rx_hash) {
-                    __u32 type = 0;
-                    bpf_xdp_metadata_rx_hash(ctx, &evt->rx_hash, (void *)&type);
+                evt->rx_hash = 0;
+                if (hw_metadata) {
+                    if (bpf_xdp_metadata_rx_hash) {
+                        __u32 type = 0;
+                        bpf_xdp_metadata_rx_hash(ctx, &evt->rx_hash, (void *)&type);
+                    }
                 }
 
                 evt->timestamp = 0;
-                if (bpf_xdp_metadata_rx_timestamp) {
-                    bpf_xdp_metadata_rx_timestamp(ctx, &evt->timestamp);
+                if (hw_metadata) {
+                    if (bpf_xdp_metadata_rx_timestamp) {
+                        bpf_xdp_metadata_rx_timestamp(ctx, &evt->timestamp);
+                    }
                 }
                 if (evt->timestamp == 0) {
                     evt->timestamp = bpf_ktime_get_ns();
@@ -212,10 +257,20 @@ int hyperion_filter(struct xdp_md *ctx) {
         }
         
         // Handoff to AF_XDP userspace
-        return bpf_redirect_map(&xsk_map, ctx->rx_queue_index, XDP_PASS);
+        return bpf_redirect_map(&xsk_map, q_idx, XDP_PASS);
     }
 
     return XDP_PASS;
+}
+
+SEC("xdp")
+int hyperion_filter_generic(struct xdp_md *ctx) {
+    return hyperion_filter_main(ctx, false);
+}
+
+SEC("xdp/hw")
+int hyperion_filter_hw(struct xdp_md *ctx) {
+    return hyperion_filter_main(ctx, true);
 }
 
 char _license[] SEC("license") = "GPL";

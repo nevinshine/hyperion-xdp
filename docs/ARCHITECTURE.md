@@ -2,6 +2,10 @@
 
 Hyperion XDP is a high-performance eBPF/AF_XDP enforcement and telemetry dataplane. It is designed around a strict separation of concerns to maximize packets-per-second (PPS) throughput while allowing deep payload inspection without violating eBPF verifier constraints.
 
+> [!IMPORTANT]
+> This architecture is strictly bound by the formal invariants defined in [INVARIANTS.md](./INVARIANTS.md). All engineering changes must mathematically and operationally preserve these guarantees.
+> Furthermore, deployment environments must adhere to the [COMPATIBILITY.md](./COMPATIBILITY.md) matrix regarding kernel verifier divergence and eBPF capabilities.
+
 ## Fast Path vs. Slow Path Design
 
 The system splits packet processing into two highly optimized domains:
@@ -93,3 +97,81 @@ graph TD
     
     J[(policy.yaml)] --> G
 ```
+
+## Invariant 7: Deterministic Degradation
+
+Userspace stalls or extreme congestion must degrade to deterministic fail-open forwarding within bounded time. The kernel fast-path must rely on synchronous heartbeat validation prior to redirection. 
+
+### Degraded Security Mode
+
+During watchdog expiry, the system enters **Degraded Security Mode**. This is an explicit architectural trade-off that prioritizes **forwarding continuity** over strict inspection guarantees. When activated:
+- AF_XDP Deep Packet Inspection (DPI) is completely bypassed.
+- Forwarding continuity is prioritized and packets flow through the default Linux network stack via `XDP_PASS`.
+- Deep inspection guarantees (e.g., L7 payload scanning) are entirely suspended until the system recovers.
+
+This ensures availability-oriented infrastructure behavior but must be explicitly acknowledged as a degraded-security operational reality.
+
+### Formal Watchdog State Machine (Backpressure-Driven)
+
+To prevent eBPF fast-path oscillation and keep the kernel logic purely O(1), state management and hysteresis are mathematically decoupled. The kernel enforces the temporal deadline, while userspace manages the congestion backpressure.
+
+#### State Constants
+
+All states are defined as typed constants in `src/user/main.go` (`WatchdogState` type):
+
+| Constant             | Value | Prometheus Gauge | Description |
+|----------------------|-------|------------------|-------------|
+| `WatchdogHealthy`    | `0`   | `hyperion_watchdog_state = 0` | DPI active, heartbeat fresh |
+| `WatchdogDegraded`   | `1`   | `hyperion_watchdog_state = 1` | Fail-open, heartbeat starved |
+| `WatchdogRecovering` | `2`   | `hyperion_watchdog_state = 2` | Hysteresis active, awaiting stability |
+
+#### State Definitions
+
+##### HEALTHY (`WatchdogHealthy = 0`)
+- **Condition:** `activeDescriptors` (atomic) is below the Congestion Threshold (default: 50% ring capacity).
+- **Semantics:** The userspace controller successfully writes its current `bpf_ktime_get_ns()` uptime to the `watchdog_map`.
+- **Intervals:** Heartbeat occurs every `10ms`.
+
+##### DEGRADED (`WatchdogDegraded = 1`)
+- **Condition:** `activeDescriptors` exceeds the Congestion Threshold, or userspace is involuntarily stalled (e.g., `SIGSTOP`, GC pause, scheduler starvation, hard crash).
+- **Semantics:** The userspace controller *intentionally starves* the heartbeat. The eBPF kernel fast-path detects the heartbeat is older than `STALL_THRESHOLD` (`50ms`) and falls back to `XDP_PASS`.
+
+##### RECOVERING (`WatchdogRecovering = 2`)
+- **Condition:** `activeDescriptors` has dropped below the threshold, but stability is not yet confirmed.
+- **Hysteresis:** 5 consecutive healthy ticks (`50ms`) required before promoting to HEALTHY.
+
+#### State Transition Diagram
+
+```
+            ┌──────────┐   backpressure    ┌──────────┐
+            │ HEALTHY  │ ──────────────►   │ DEGRADED │
+            │   (0)    │                   │   (1)    │◄─┐
+            └──────────┘                   └──────────┘  │
+                  ▲                              │       │ re-congestion
+                  │ hysteresis_complete          ▼       │
+                  │                        ┌──────────┐  │
+                  └──────────────────────  │RECOVERING│──┘
+                                           │   (2)    │
+                                           └──────────┘
+```
+
+#### Transition Audit Logging
+
+Every state transition emits a structured log entry:
+
+```
+[WATCHDOG] HEALTHY → DEGRADED | reason=af_xdp_backpressure
+[WATCHDOG] DEGRADED → RECOVERING | reason=backpressure_subsided
+[WATCHDOG] RECOVERING → HEALTHY | reason=hysteresis_complete (stall=0.127s)
+```
+
+Each entry records: old state, new state, causal reason, and stall duration (on recovery).
+
+#### Prometheus Metrics Reference
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `hyperion_watchdog_state` | Gauge | Current state (0/1/2) |
+| `hyperion_watchdog_degraded_total` | Counter | Total degradation events |
+| `hyperion_watchdog_recovery_total` | Counter | Total successful recoveries |
+| `hyperion_watchdog_stall_seconds` | Histogram | Duration of degradation episodes |
