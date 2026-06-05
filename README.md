@@ -96,7 +96,7 @@ Controlled fault-injection experiments demonstrated several critical behaviors o
 * Destroying AF_XDP UMEM ownership under load can trigger persistent descriptor retry loops (`rx*_xsk_buff_alloc_err`) inside the NIC firmware.
 * Removing queues from RSS steering and deleting `xsk_map` redirects does not necessarily terminate firmware-level polling behavior.
 * Dynamic rebinding of a fresh UMEM to a queue trapped in a retry state triggered severe node instability and DMA-related failures on the tested hardware.
-* Physical interface reset (`ip link down/up`) successfully terminated the retry state and restored convergence.
+* An interface reset sequence (`ip link down/up`) successfully terminated the retry state and restored convergence.
 
 A key finding of the experiments is that Linux-visible queue teardown semantics can successfully complete while firmware-visible descriptor execution remains permanently active, creating a divergence between software teardown state and hardware execution state.
 
@@ -107,7 +107,7 @@ These observations indicate that software-visible teardown completion does not n
 
 ### Architectural Implications
 
-The experiments imply that safe live queue-local rehabilitation may not currently be achievable on the tested `mlx5_core` / ConnectX-4 Lx / Linux 6.8 stack once persistent descriptor retry states emerge.
+The experiments imply that reliable queue-local rehabilitation may not currently be achievable on the tested `mlx5_core` / ConnectX-4 Lx / Linux 6.8 stack once persistent descriptor retry states emerge.
 
 As a result, Hyperion treats queue lifecycle orchestration as a first-class systems concern, emphasizing:
 
@@ -147,6 +147,7 @@ Current observations are constrained to:
 - `asavie/xdp` userspace bindings
 
 The project has not yet validated:
+- non-zero-copy AF_XDP mode behavior
 - Intel `ice`
 - Intel `ixgbe`
 - Broadcom NICs
