@@ -74,17 +74,46 @@ Heavy lifting is punted to the Go userspace engine via `github.com/asavie/xdp`.
 
 ---
 
-## Zero-Copy Queue Orchestration Semantics
+## Zero-Copy Queue Lifecycle Orchestration
 
 Hyperion has evolved from a simple packet engine into a **hardware queue orchestration runtime**. Rigorous behavioral isolation experiments on Mellanox `mlx5` zero-copy architectures have demonstrated that logical AF_XDP queue teardown (closing the socket) is insufficient to terminate hardware descriptor ownership.
 
-Safe queue orchestration requires explicit coordination across **three independent control planes**:
+The experiments indicate that safe queue orchestration requires coordination across multiple independent state planes:
 
-1. **Traffic Steering Plane** (`ethtool -X` / RSS): Controls which hardware queue physically receives packets from the wire.
-2. **AF_XDP Redirect Plane** (`xsk_map`): Controls whether the eBPF kernel program routes packets into userspace.
-3. **DMA Descriptor Ownership Plane** (NIC Firmware): Controls the low-level descriptor refill lifecycle, UMEM ownership, and hardware polling.
+1. **Traffic Steering Plane** (`ethtool -X` / RSS)
+   * Determines which hardware RX queues physically receive packets from the wire.
+2. **eBPF Redirect Plane** (`xsk_map`)
+   * Controls whether packets are redirected into AF_XDP userspace sockets.
+3. **DMA Descriptor Ownership Plane**
+   * Governs UMEM descriptor refill ownership and AF_XDP queue memory registration.
+4. **Firmware Execution Plane**
+   * Internal NIC firmware execution state responsible for descriptor polling, retry behavior, queue execution context, and DMA scheduling.
 
-**The Orchestration Mandate**: Failure to synchronize these planes produces permanently non-converging descriptor retry loops in the NIC firmware ("half-dead firmware limbo state"). Attempting to dynamically rebind a fresh UMEM to a queue trapped in this retry loop triggers a catastrophic PCIe DMA fault. Thus, true queue-local micro-failover is physically impossible on current `mlx5` hardware; a physical interface bounce is required to forcibly reset the dangling firmware ownership. 
+### Experimental Findings
+
+Controlled fault-injection experiments demonstrated several critical behaviors on the tested `mlx5` stack:
+
+* Destroying AF_XDP UMEM ownership under load can trigger persistent descriptor retry loops (`rx*_xsk_buff_alloc_err`) inside the NIC firmware.
+* Removing queues from RSS steering and deleting `xsk_map` redirects does not necessarily terminate firmware-level polling behavior.
+* Dynamic rebinding of a fresh UMEM to a queue trapped in a retry state triggered catastrophic node instability and DMA faults on the tested hardware.
+* Physical interface reset (`ip link down/up`) successfully terminated the retry state and restored convergence.
+
+These results strongly suggest that Linux-visible teardown semantics can diverge from firmware-visible execution semantics during AF_XDP zero-copy failure conditions.
+
+### Architectural Implications
+
+The experiments imply that queue-local micro-failover may not be safely achievable on the tested `mlx5_core` / ConnectX-4 Lx / Linux 6.8 stack once persistent descriptor retry states emerge.
+
+As a result, Hyperion treats queue lifecycle orchestration as a first-class systems concern, emphasizing:
+
+* deterministic queue fencing
+* explicit RSS control
+* watchdog-driven degradation semantics
+* descriptor convergence monitoring
+* orchestration-aware teardown sequencing
+* interface-wide recovery policies when queue-local recovery is unsafe
+
+The project therefore serves both as a high-performance dataplane and as a research platform for studying AF_XDP zero-copy lifecycle behavior under adversarial failure conditions.
 
 ---
 
@@ -132,6 +161,51 @@ Hyperion exposes a `/metrics` Prometheus endpoint on port `2112`, tracking:
 - `hyperion_slowpath_drops_total`: Packets dropped by AF_XDP DPI.
 - `hyperion_redirect_failures_total`: Map redirect failures (userspace disconnects).
 - `hyperion_afxdp_rx_queue_pressure`: Ring buffer occupancy.
+
+---
+
+## Queue Lifecycle & Failure-Semantics Benchmarking
+
+Hyperion's benchmarking framework extends beyond throughput measurement into deterministic queue lifecycle analysis and failure-semantics validation.
+
+The benchmarking harness captures:
+
+* queue occupancy oscillation
+* watchdog transition timing
+* degradation-state dwell distributions
+* IRQ topology stability
+* scheduler jitter
+* NAPI budget pressure
+* descriptor retry convergence behavior
+* AF_XDP teardown semantics under sustained load
+
+### Experimental Infrastructure
+
+Experiments are executed on isolated CloudLab bare-metal systems using Mellanox `mlx5` NICs with explicit IRQ affinity pinning, CPU governor locking, RSS control, and continuous telemetry capture.
+
+Telemetry streams include:
+
+* `/proc/interrupts`
+* `/proc/net/softnet_stat`
+* `ethtool -S`
+* `bpftool`
+* `turbostat`
+* Prometheus queue metrics
+* AF_XDP descriptor pressure metrics
+
+### Failure Injection Methodology
+
+Hyperion includes controlled fault injection for studying dataplane degradation and recovery behavior under stress conditions:
+
+* AF_XDP userspace termination (`SIGTERM`, `SIGKILL`)
+* queue fencing (`xsk_map` detach)
+* RSS steering withdrawal
+* descriptor starvation
+* queue-local teardown
+* live rebinding experiments
+* saturation-induced degradation
+
+The objective is not merely to maximize packets-per-second, but to characterize how zero-copy dataplanes behave during ownership transitions, teardown races, and hardware retry conditions.
 
 ---
 
