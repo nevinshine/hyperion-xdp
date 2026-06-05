@@ -14,22 +14,6 @@ Hyperion XDP is a measurable, infrastructure-grade network dataplane designed fo
 
 ---
 
-## Research Contributions
-
-Hyperion contributes several experimentally-derived observations regarding AF_XDP zero-copy lifecycle behavior under sustained load:
-
-* empirical characterization of persistent descriptor retry states
-* queue-level teardown and rebinding failure analysis
-* isolation of firmware-visible versus Linux-visible teardown divergence
-* deterministic queue fencing and RSS orchestration methodology
-* descriptor convergence telemetry instrumentation
-* watchdog-driven degradation semantics for AF_XDP dataplanes
-* orchestration-aware queue lifecycle modeling under adversarial failure conditions
-
-The project therefore serves both as a deployable XDP dataplane and as a systems research platform for studying zero-copy queue orchestration behavior.
-
----
-
 ## Architectural Split: Fast Path vs. Slow Path
 
 To maintain strict eBPF verifier discipline and guarantee hardware-bound throughput, Hyperion physically segregates packet processing.
@@ -111,7 +95,7 @@ Controlled fault-injection experiments demonstrated several critical behaviors o
 
 * Destroying AF_XDP UMEM ownership under load can trigger persistent descriptor retry loops (`rx*_xsk_buff_alloc_err`) inside the NIC firmware.
 * Removing queues from RSS steering and deleting `xsk_map` redirects does not necessarily terminate firmware-level polling behavior.
-* Dynamic rebinding of a fresh UMEM to a queue trapped in a retry state triggered catastrophic node instability and DMA faults on the tested hardware.
+* Dynamic rebinding of a fresh UMEM to a queue trapped in a retry state triggered severe node instability and DMA-related failures on the tested hardware.
 * Physical interface reset (`ip link down/up`) successfully terminated the retry state and restored convergence.
 
 A key finding of the experiments is that Linux-visible queue teardown semantics can successfully complete while firmware-visible descriptor execution remains permanently active, creating a divergence between software teardown state and hardware execution state.
@@ -119,7 +103,7 @@ A key finding of the experiments is that Linux-visible queue teardown semantics 
 > [!IMPORTANT]
 > The reported behaviors were observed specifically on Mellanox ConnectX-4 Lx hardware using the `mlx5_core` driver and Linux 6.8 with AF_XDP zero-copy sockets. The experiments do not claim universal behavior across all NIC vendors, driver implementations, or AF_XDP architectures.
 
-These results strongly suggest that Linux-visible teardown semantics can diverge from firmware-visible execution semantics during AF_XDP zero-copy failure conditions.
+These observations indicate that software-visible teardown completion does not necessarily imply hardware-level execution convergence.
 
 ### Architectural Implications
 
@@ -134,30 +118,42 @@ As a result, Hyperion treats queue lifecycle orchestration as a first-class syst
 * orchestration-aware teardown sequencing
 * interface-wide recovery policies when queue-local recovery is unsafe
 
-The project therefore serves both as a high-performance dataplane and as a research platform for studying AF_XDP zero-copy lifecycle behavior under adversarial failure conditions.
+---
+
+## Research Contributions
+
+Hyperion contributes several experimentally-derived observations regarding AF_XDP zero-copy lifecycle behavior under sustained load:
+
+* empirical characterization of persistent descriptor retry states
+* queue-level teardown and rebinding failure analysis
+* isolation of firmware-visible versus Linux-visible teardown divergence
+* deterministic queue fencing and RSS orchestration methodology
+* descriptor convergence telemetry instrumentation
+* watchdog-driven degradation semantics for AF_XDP dataplanes
+* orchestration-aware queue lifecycle modeling under adversarial failure conditions
+
+The project therefore serves both as an experimental high-performance XDP dataplane and as a systems research platform for studying zero-copy queue orchestration behavior.
 
 ---
 
-## Failure-Mode Documentation
+## Known Limitations
 
-Infrastructure credibility requires deterministic behavior when things break. Hyperion implements explicit failure states:
+Current observations are constrained to:
 
-| Failure Scenario | Resolution | Security Stance |
-|:-----------------|:-----------|:----------------|
-| **Go Userspace Crash** | `bpf_redirect_map` returns an error if the AF_XDP socket (`xsk_map`) is dead or not bound. | **Fail-Closed (Optional)** or **Fail-Open (Default)**. Currently, unroutable AF_XDP packets fall back to `XDP_PASS` to avoid network isolation, incrementing the `hyperion_redirect_failures_total` Prometheus counter. |
-| **Rx Queue Overflow** | If the AF_XDP fill ring is exhausted, the kernel drops the packet. | **Fail-Closed**. Packets are dropped, incrementing interface `rx_dropped` counters. |
-| **Map Exhaustion** | The IP blocklist utilizes `BPF_MAP_TYPE_LRU_HASH`. | **Self-Healing**. Stale IP addresses are automatically evicted to make room for new blocks. |
+- Mellanox ConnectX-4 Lx hardware
+- `mlx5_core`
+- Linux 6.8
+- AF_XDP zero-copy mode
+- `asavie/xdp` userspace bindings
 
----
-
-## Verifier Statistics & Discipline
-
-Writing raw eBPF requires strict adherence to verifier budgets to ensure the kernel doesn't deadlock. Hyperion's `hyperion_core.c` operates well below these limits:
-
-- **Instruction Count**: ~150 instructions (Limit: 1,000,000). By removing payload signature loops (`#pragma unroll`) from the kernel and punting them to AF_XDP, we achieved a massive reduction in logic depth.
-- **Stack Usage**: ~128 bytes (Limit: 512 bytes). Variables are tightly scoped, and large structs are pushed directly into ring buffers.
-- **Tail-Call Depth**: 0 (Limit: 33). The dataplane is currently monolithic but modular enough to support tail-call pipelines in the future if required.
-- **Helper Calls**: Strictly limited to `bpf_map_lookup_elem`, `bpf_redirect_map`, and `bpf_ringbuf_*`.
+The project has not yet validated:
+- Intel `ice`
+- Intel `ixgbe`
+- Broadcom NICs
+- multi-NUMA queue migration
+- SmartNIC offload architectures
+- shared-UMEM queue orchestration
+- hardware-assisted queue reset semantics
 
 ---
 
@@ -227,6 +223,29 @@ Hyperion includes controlled fault injection for studying dataplane degradation 
 * saturation-induced degradation
 
 The objective is not merely to maximize packets-per-second, but to characterize how zero-copy dataplanes behave during ownership transitions, teardown races, and hardware retry conditions.
+
+---
+
+## Failure-Mode Documentation
+
+Infrastructure credibility requires deterministic behavior when things break. Hyperion implements explicit failure states:
+
+| Failure Scenario | Resolution | Security Stance |
+|:-----------------|:-----------|:----------------|
+| **Go Userspace Crash** | `bpf_redirect_map` returns an error if the AF_XDP socket (`xsk_map`) is dead or not bound. | **Fail-Closed (Optional)** or **Fail-Open (Default)**. Currently, unroutable AF_XDP packets fall back to `XDP_PASS` to avoid network isolation, incrementing the `hyperion_redirect_failures_total` Prometheus counter. |
+| **Rx Queue Overflow** | If the AF_XDP fill ring is exhausted, the kernel drops the packet. | **Fail-Closed**. Packets are dropped, incrementing interface `rx_dropped` counters. |
+| **Map Exhaustion** | The IP blocklist utilizes `BPF_MAP_TYPE_LRU_HASH`. | **Self-Healing**. Stale IP addresses are automatically evicted to make room for new blocks. |
+
+---
+
+## Verifier Statistics & Discipline
+
+Writing raw eBPF requires strict adherence to verifier budgets to ensure the kernel doesn't deadlock. Hyperion's `hyperion_core.c` operates well below these limits:
+
+- **Instruction Count**: ~150 instructions (Limit: 1,000,000). By removing payload signature loops (`#pragma unroll`) from the kernel and punting them to AF_XDP, we achieved a massive reduction in logic depth.
+- **Stack Usage**: ~128 bytes (Limit: 512 bytes). Variables are tightly scoped, and large structs are pushed directly into ring buffers.
+- **Tail-Call Depth**: 0 (Limit: 33). The dataplane is currently monolithic but modular enough to support tail-call pipelines in the future if required.
+- **Helper Calls**: Strictly limited to `bpf_map_lookup_elem`, `bpf_redirect_map`, and `bpf_ringbuf_*`.
 
 ---
 
