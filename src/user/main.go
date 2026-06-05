@@ -99,32 +99,32 @@ var (
 		Name: "hyperion_hw_nic_drops_total",
 		Help: "Hardware-level NIC drops scraped via ethtool",
 	}, []string{"stat"})
-	metricWatchdogDegraded = promauto.NewCounter(prometheus.CounterOpts{
+	metricWatchdogDegraded = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "hyperion_watchdog_degraded_total",
 		Help: "Number of times the dataplane entered starvation/congestion mode (Fail-Open)",
-	})
-	metricWatchdogState = promauto.NewGauge(prometheus.GaugeOpts{
+	}, []string{"queue"})
+	metricWatchdogState = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "hyperion_watchdog_state",
 		Help: "Current state of the dataplane watchdog (0 = Healthy, 1 = Degraded, 2 = Recovering)",
-	})
-	metricWatchdogRecovery = promauto.NewCounter(prometheus.CounterOpts{
+	}, []string{"queue"})
+	metricWatchdogRecovery = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "hyperion_watchdog_recovery_total",
 		Help: "Number of times the dataplane successfully recovered from starvation back to healthy",
-	})
-	metricWatchdogDegradedSeconds = promauto.NewHistogram(prometheus.HistogramOpts{
+	}, []string{"queue"})
+	metricWatchdogDegradedSeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "hyperion_watchdog_degraded_seconds",
 		Help:    "Duration spent actively degraded due to congestion backpressure",
 		Buckets: []float64{0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 60.0},
-	})
-	metricWatchdogRecoveringSeconds = promauto.NewHistogram(prometheus.HistogramOpts{
+	}, []string{"queue"})
+	metricWatchdogRecoveringSeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "hyperion_watchdog_recovering_seconds",
 		Help:    "Duration spent in hysteresis recovery window before promoting to healthy",
 		Buckets: []float64{0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 60.0},
-	})
-	metricRingOccupancy = promauto.NewGauge(prometheus.GaugeOpts{
+	}, []string{"queue"})
+	metricRingOccupancy = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "hyperion_ring_occupancy",
 		Help: "Current number of active AF_XDP descriptors checked out to userspace",
-	})
+	}, []string{"queue"})
 )
 
 // WatchdogState represents the formal operational state of the dataplane watchdog.
@@ -164,7 +164,7 @@ func (s WatchdogState) String() string {
 }
 
 var bootTimeOffset int64
-var activeDescriptors int32
+var activeDescriptors []int32
 
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc $BPF_CLANG -cflags $BPF_CFLAGS bpf ../kern/hyperion_core.c -- -I../common
 
@@ -365,8 +365,12 @@ func main() {
 		fmt.Printf("%s[+] Slow Path AF_XDP socket bound to queue %d%s\n", ColorGreen, q, ColorReset)
 	}
 
-	// Launch Backpressure-Driven Watchdog
-	go watchdogLoop(&objs, xsks)
+	activeDescriptors = make([]int32, *queues)
+
+	// Launch Backpressure-Driven Watchdog per-queue
+	for q := 0; q < *queues; q++ {
+		go watchdogLoop(q, &objs, xsks[q])
+	}
 
 	// 5. Start Prometheus endpoint
 	go func() {
@@ -423,6 +427,7 @@ func main() {
 		numCPUs, _ := ebpf.PossibleCPU()
 		lastBlockDrops := make([]uint64, numCPUs)
 		lastRedirectFails := make([]uint64, numCPUs)
+		lastWatchdogFails := make([]uint64, numCPUs)
 
 		for {
 			time.Sleep(1 * time.Second)
@@ -446,6 +451,17 @@ func main() {
 					if diff > 0 {
 						metricRedirectFailures.WithLabelValues(fmt.Sprintf("%d", i)).Add(float64(diff))
 						lastRedirectFails[i] = perCPUVals[i]
+					}
+				}
+			}
+
+			// Watchdog Degradation / Fail-Open (Reason = 3)
+			if err := objs.DropStatsMap.Lookup(uint32(3), &perCPUVals); err == nil {
+				for i := 0; i < numCPUs && i < len(perCPUVals); i++ {
+					diff := perCPUVals[i] - lastWatchdogFails[i]
+					if diff > 0 {
+						metricFastDrops.WithLabelValues("watchdog_failopen").Add(float64(diff))
+						lastWatchdogFails[i] = perCPUVals[i]
 					}
 				}
 			}
@@ -497,7 +513,11 @@ func main() {
 			defer runtime.UnlockOSThread()
 			
 			qStr := fmt.Sprintf("%d", queueID)
-			simulateLag := os.Getenv("HYPERION_SIMULATE_LAG") != ""
+			simulateLag := int32(0)
+	if os.Getenv("HYPERION_SIMULATE_LAG") == "1" {
+		simulateLag = 1
+	}
+
 
 			if cpuBase >= 0 {
 				targetCPU := cpuBase + queueID
@@ -516,12 +536,12 @@ func main() {
 				wakeupStart := time.Now()
 				numReceived, _, err := xsk.Poll(-1)
 				if err != nil {
-					continue
+					return
 				}
 
 				if numReceived > 0 {
 					descs := xsk.Receive(numReceived)
-					atomic.AddInt32(&activeDescriptors, int32(numReceived))
+					atomic.AddInt32(&activeDescriptors[queueID], int32(numReceived))
 					
 					latencyMs := float64(time.Since(wakeupStart).Nanoseconds()) / 1e6
 					metricWakeupLatency.WithLabelValues(qStr).Observe(latencyMs)
@@ -534,18 +554,18 @@ func main() {
 						
 						if action == "drop" {
 							metricSlowDrops.WithLabelValues(reason, qStr).Inc()
-							fmt.Printf("[%s] %sAF_XDP_DPI_DROP%s (Q:%d) Reason: %s (Len: %d)\n",
+							fmt.Printf("[%s] %sAF_XDP_DPI_DROP%s (Q:%d) Reason: %s (Len: %d) [ts_ns=%d]\n",
 								time.Now().Format("15:04:05"), ColorYellow, ColorReset,
-								queueID, reason, len(frameData))
+								queueID, reason, len(frameData), time.Now().UnixNano())
 						}
 					}
 					
-					if simulateLag {
-						time.Sleep(20 * time.Millisecond) // Artificially cripple processing speed to simulate severe GC/Load
+					if atomic.LoadInt32(&simulateLag) == 1 {
+						time.Sleep(5 * time.Millisecond) // Artificially cripple processing speed to simulate severe GC/Load
 					}
 
 					xsk.Fill(descs)
-					atomic.AddInt32(&activeDescriptors, -int32(numReceived))
+					atomic.AddInt32(&activeDescriptors[queueID], -int32(numReceived))
 				}
 			}
 		}(q, *cpuPin, xsks[q])
@@ -553,7 +573,7 @@ func main() {
 
 	// 8. Graceful Shutdown
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGUSR1, syscall.SIGUSR2)
 
 	for {
 		sig := <-sigChan
@@ -566,6 +586,75 @@ func main() {
 				applyFastPathPolicy(objs, config.FastPath)
 				fmt.Printf("%s[+] Policy Hot-Reloaded%s\n", ColorGreen, ColorReset)
 			}
+		case syscall.SIGUSR1:
+			log.Println("[*] SACRIFICIAL TEARDOWN: Fencing and destroying Queue 7")
+			objs.XskMap.Delete(uint32(7))
+			if xsks[7] != nil {
+				xsks[7].Close()
+				xsks[7] = nil
+				log.Println("[*] Queue 7 XSK socket closed and UMEM unmapped. Worker should exit.")
+			}
+		case syscall.SIGUSR2:
+			log.Println("[*] RESURRECTION (PHASE A): Rebinding fresh UMEM to Queue 7")
+			
+			xdp.DefaultSocketFlags = unix.XDP_ZEROCOPY
+			iface, _ := net.InterfaceByName(*ifaceName)
+			
+			xsk, err := xdp.NewSocket(iface.Index, 7, nil)
+			if err != nil {
+				log.Printf("[!] Failed to resurrect Queue 7: %v", err)
+				continue
+			}
+			
+			descs := xsk.GetDescs(xsk.NumFreeFillSlots())
+			xsk.Fill(descs)
+			
+			xsks[7] = xsk
+			
+			if err := objs.XskMap.Put(uint32(7), uint32(xsk.FD())); err != nil {
+				log.Printf("[!] Failed to insert resurrected Queue 7 into xsk_map: %v", err)
+			}
+			
+			log.Println("[*] Queue 7 re-bound to kernel. Starting new worker goroutine.")
+			
+			go func(queueID int, cpuBase int, xsk *xdp.Socket) {
+				runtime.LockOSThread()
+				defer runtime.UnlockOSThread()
+				qStr := fmt.Sprintf("%d", queueID)
+				simulateLag := int32(0)
+				if os.Getenv("HYPERION_SIMULATE_LAG") == "1" {
+					simulateLag = 1
+				}
+				if cpuBase >= 0 {
+					targetCPU := cpuBase + queueID
+					var mask unix.CPUSet
+					mask.Set(targetCPU)
+					unix.SchedSetaffinity(0, &mask)
+				}
+				for {
+					wakeupStart := time.Now()
+					numReceived, _, err := xsk.Poll(-1)
+					if err != nil {
+						return
+					}
+					if numReceived > 0 {
+						descs := xsk.Receive(numReceived)
+						atomic.AddInt32(&activeDescriptors[queueID], int32(numReceived))
+						latencyMs := float64(time.Since(wakeupStart).Nanoseconds()) / 1e6
+						metricWakeupLatency.WithLabelValues(qStr).Observe(latencyMs)
+						for i := 0; i < len(descs); i++ {
+							frameData := xsk.GetFrame(descs[i])
+							metricSlowInspections.WithLabelValues(qStr).Inc()
+							action, reason := evaluateSlowPathPolicy(frameData, config.SlowPath)
+							if action == "drop" {
+								metricSlowDrops.WithLabelValues(reason, qStr).Inc()
+							}
+						}
+						xsk.Fill(descs)
+						atomic.AddInt32(&activeDescriptors[queueID], -int32(numReceived))
+					}
+				}
+			}(7, *cpuPin, xsks[7])
 		case syscall.SIGINT, syscall.SIGTERM:
 			fmt.Printf("\n%s[-] Shutting down Hyperion AF_XDP...%s\n", ColorRed, ColorReset)
 			
@@ -654,14 +743,15 @@ func loadPinnedMapSafe(path string) (*ebpf.Map, error) {
 	return ebpf.LoadPinnedMap(path, nil)
 }
 
-func watchdogLoop(objs *bpfObjects, xsks []*xdp.Socket) {
+func watchdogLoop(queueID int, objs *bpfObjects, xsk *xdp.Socket) {
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	
-	key := uint32(0)
+	key := uint32(queueID)
 	state := WatchdogHealthy
 	consecutiveHealthy := 0
 	stateEnteredAt := time.Now()
+	qStr := fmt.Sprintf("%d", queueID)
 
 	threshold := 1024 // default 50% capacity
 	if val := os.Getenv("HYPERION_CONGESTION_THRESHOLD"); val != "" {
@@ -691,7 +781,7 @@ func watchdogLoop(objs *bpfObjects, xsks []*xdp.Socket) {
 		
 		// Formal FSM Validation
 		if allowed, ok := allowedTransitions[state][newState]; !ok || !allowed {
-			log.Fatalf("[FATAL] Illegal FSM Transition Attempted: %s → %s (reason: %s)", state, newState, reason)
+			log.Fatalf("[FATAL] Illegal FSM Transition Attempted: [Q:%d] %s → %s (reason: %s)", queueID, state, newState, reason)
 		}
 
 		now := time.Now()
@@ -699,20 +789,20 @@ func watchdogLoop(objs *bpfObjects, xsks []*xdp.Socket) {
 		
 		// Split Histograms
 		if state == WatchdogDegraded {
-			metricWatchdogDegradedSeconds.Observe(durationInState.Seconds())
+			metricWatchdogDegradedSeconds.WithLabelValues(qStr).Observe(durationInState.Seconds())
 		} else if state == WatchdogRecovering {
-			metricWatchdogRecoveringSeconds.Observe(durationInState.Seconds())
+			metricWatchdogRecoveringSeconds.WithLabelValues(qStr).Observe(durationInState.Seconds())
 		}
 		
 		oldState := state
 		state = newState
 		stateEnteredAt = now
-		metricWatchdogState.Set(float64(newState))
+		metricWatchdogState.WithLabelValues(qStr).Set(float64(newState))
 		
 		if details != "" {
-			log.Printf("[WATCHDOG] %s → %s | reason=%s | details=%s | duration=%.3fs", oldState, newState, reason, details, durationInState.Seconds())
+			log.Printf("[WATCHDOG] [Q:%d] %s → %s | reason=%s | details=%s | duration=%.3fs | ts_ns=%d", queueID, oldState, newState, reason, details, durationInState.Seconds(), now.UnixNano())
 		} else {
-			log.Printf("[WATCHDOG] %s → %s | reason=%s | duration=%.3fs", oldState, newState, reason, durationInState.Seconds())
+			log.Printf("[WATCHDOG] [Q:%d] %s → %s | reason=%s | duration=%.3fs | ts_ns=%d", queueID, oldState, newState, reason, durationInState.Seconds(), now.UnixNano())
 		}
 	}
 
@@ -720,8 +810,8 @@ func watchdogLoop(objs *bpfObjects, xsks []*xdp.Socket) {
 		congested := false
 		
 		// Update Ring Occupancy Gauge
-		currentOccupancy := atomic.LoadInt32(&activeDescriptors)
-		metricRingOccupancy.Set(float64(currentOccupancy))
+		currentOccupancy := atomic.LoadInt32(&activeDescriptors[queueID])
+		metricRingOccupancy.WithLabelValues(qStr).Set(float64(currentOccupancy))
 		
 		// mathematically correct backpressure: how many packets are checked out and stalling?
 		if currentOccupancy > int32(threshold) {
@@ -733,7 +823,7 @@ func watchdogLoop(objs *bpfObjects, xsks []*xdp.Socket) {
 				transitionTo(WatchdogDegraded, ReasonBackpressure, "")
 			}
 			consecutiveHealthy = 0
-			metricWatchdogDegraded.Inc()
+			metricWatchdogDegraded.WithLabelValues(qStr).Inc()
 			continue // Deliberately starve the watchdog
 		}
 		
@@ -748,7 +838,7 @@ func watchdogLoop(objs *bpfObjects, xsks []*xdp.Socket) {
 			}
 			// Fully recovered
 			consecutiveHealthy = 0
-			metricWatchdogRecovery.Inc()
+			metricWatchdogRecovery.WithLabelValues(qStr).Inc()
 			transitionTo(WatchdogHealthy, ReasonHysteresisComplete, "")
 		}
 		
@@ -757,7 +847,7 @@ func watchdogLoop(objs *bpfObjects, xsks []*xdp.Socket) {
 		
 		err := objs.WatchdogMap.Put(key, ktime)
 		if err != nil {
-			log.Printf("Watchdog update failed: %v", err)
+			log.Printf("[Q:%d] Watchdog update failed: %v", queueID, err)
 		}
 	}
 }

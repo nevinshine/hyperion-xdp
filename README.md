@@ -74,6 +74,20 @@ Heavy lifting is punted to the Go userspace engine via `github.com/asavie/xdp`.
 
 ---
 
+## Zero-Copy Queue Orchestration Semantics
+
+Hyperion has evolved from a simple packet engine into a **hardware queue orchestration runtime**. Rigorous behavioral isolation experiments on Mellanox `mlx5` zero-copy architectures have demonstrated that logical AF_XDP queue teardown (closing the socket) is insufficient to terminate hardware descriptor ownership.
+
+Safe queue orchestration requires explicit coordination across **three independent control planes**:
+
+1. **Traffic Steering Plane** (`ethtool -X` / RSS): Controls which hardware queue physically receives packets from the wire.
+2. **AF_XDP Redirect Plane** (`xsk_map`): Controls whether the eBPF kernel program routes packets into userspace.
+3. **DMA Descriptor Ownership Plane** (NIC Firmware): Controls the low-level descriptor refill lifecycle, UMEM ownership, and hardware polling.
+
+**The Orchestration Mandate**: Failure to synchronize these planes produces permanently non-converging descriptor retry loops in the NIC firmware ("half-dead firmware limbo state"). Attempting to dynamically rebind a fresh UMEM to a queue trapped in this retry loop triggers a catastrophic PCIe DMA fault. Thus, true queue-local micro-failover is physically impossible on current `mlx5` hardware; a physical interface bounce is required to forcibly reset the dangling firmware ownership. 
+
+---
+
 ## Failure-Mode Documentation
 
 Infrastructure credibility requires deterministic behavior when things break. Hyperion implements explicit failure states:
