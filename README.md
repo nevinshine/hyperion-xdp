@@ -10,7 +10,23 @@
   <img src="https://img.shields.io/badge/License-GPL-green?style=for-the-badge" />
 </p>
 
-Hyperion XDP is a measurable, infrastructure-grade network dataplane designed for extreme high-throughput packet filtering and Deep Packet Inspection (DPI). By leveraging eBPF and AF_XDP zero-copy sockets, Hyperion intercepts traffic directly at the NIC driver—before the Linux kernel network stack allocates an `sk_buff`—yielding deterministic microsecond latency and massive packets-per-second (PPS) scalability.
+Hyperion XDP is a measurable, infrastructure-grade network dataplane designed for extreme high-throughput packet filtering and Deep Packet Inspection (DPI). By leveraging eBPF and AF_XDP zero-copy sockets, Hyperion intercepts traffic directly at the NIC driver—before the Linux kernel network stack allocates an `sk_buff`—yielding low-latency, high-throughput packet processing with explicit queue-level observability.
+
+---
+
+## Research Contributions
+
+Hyperion contributes several experimentally-derived observations regarding AF_XDP zero-copy lifecycle behavior under sustained load:
+
+* empirical characterization of persistent descriptor retry states
+* queue-level teardown and rebinding failure analysis
+* isolation of firmware-visible versus Linux-visible teardown divergence
+* deterministic queue fencing and RSS orchestration methodology
+* descriptor convergence telemetry instrumentation
+* watchdog-driven degradation semantics for AF_XDP dataplanes
+* orchestration-aware queue lifecycle modeling under adversarial failure conditions
+
+The project therefore serves both as a deployable XDP dataplane and as a systems research platform for studying zero-copy queue orchestration behavior.
 
 ---
 
@@ -98,11 +114,16 @@ Controlled fault-injection experiments demonstrated several critical behaviors o
 * Dynamic rebinding of a fresh UMEM to a queue trapped in a retry state triggered catastrophic node instability and DMA faults on the tested hardware.
 * Physical interface reset (`ip link down/up`) successfully terminated the retry state and restored convergence.
 
+A key finding of the experiments is that Linux-visible queue teardown semantics can successfully complete while firmware-visible descriptor execution remains permanently active, creating a divergence between software teardown state and hardware execution state.
+
+> [!IMPORTANT]
+> The reported behaviors were observed specifically on Mellanox ConnectX-4 Lx hardware using the `mlx5_core` driver and Linux 6.8 with AF_XDP zero-copy sockets. The experiments do not claim universal behavior across all NIC vendors, driver implementations, or AF_XDP architectures.
+
 These results strongly suggest that Linux-visible teardown semantics can diverge from firmware-visible execution semantics during AF_XDP zero-copy failure conditions.
 
 ### Architectural Implications
 
-The experiments imply that queue-local micro-failover may not be safely achievable on the tested `mlx5_core` / ConnectX-4 Lx / Linux 6.8 stack once persistent descriptor retry states emerge.
+The experiments imply that safe live queue-local rehabilitation may not currently be achievable on the tested `mlx5_core` / ConnectX-4 Lx / Linux 6.8 stack once persistent descriptor retry states emerge.
 
 As a result, Hyperion treats queue lifecycle orchestration as a first-class systems concern, emphasizing:
 
